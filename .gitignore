@@ -11,4 +11,8 @@ dist/
 !.env.example
 support_docs/*
 !support_docs/.gitkeep
+kb_archive/*
+!kb_archive/.gitkeep
+company_docs/*
+!company_docs/.gitkeep
 backend/uploads/*

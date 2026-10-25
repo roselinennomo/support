@@ -44,6 +44,7 @@ def _company_out(company: Company) -> dict:
         "id": company.id,
         "name": company.name,
         "is_active": company.is_active,
+        "is_individual": company.is_individual,
         "agent_ids": [agent.id for agent in company.agents],
         "created_at": company.created_at,
     }
@@ -290,6 +291,8 @@ def rotate_company_invitation_code(
     company = db.get(Company, company_id)
     if not company or not company.is_active or not _can_access_company(db, company.id, actor):
         raise HTTPException(status_code=404, detail="Entreprise introuvable.")
+    if company.is_individual:
+        raise HTTPException(status_code=409, detail="Une entreprise individuelle n’a pas de code d’invitation.")
     invitation_code = secrets.token_urlsafe(18)
     company.invitation_code_hash = hashlib.sha256(invitation_code.encode()).hexdigest()
     db.commit()

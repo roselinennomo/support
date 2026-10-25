@@ -40,7 +40,7 @@ def test_sync_indexes_changed_sources_and_removes_deleted(monkeypatch, tmp_path)
 
 def test_retrieve_context_formats_qdrant_references(monkeypatch):
     monkeypatch.setattr(rag, "_ensure_collection", lambda: None)
-    monkeypatch.setattr(rag, "_sync_documents", lambda: None)
+    monkeypatch.setattr(rag, "_sync_documents", lambda **_kwargs: None)
     monkeypatch.setattr(rag, "_embed", lambda _texts: [[0.0] * rag.settings.rag_embedding_dimension])
     monkeypatch.setattr(
         rag,
@@ -129,7 +129,8 @@ def test_inspect_index_reports_documents_services_and_orphaned_sources(monkeypat
 
     def fake_get(url, **_kwargs):
         if url.endswith("/api/tags"):
-            return Response({"models": [{"name": "nomic-embed-text:latest"}]})
+            # qwen3-embedding:4b installé ne doit pas valider le modèle actif qwen3-embedding:0.6b.
+            return Response({"models": [{"name": "qwen3-embedding:0.6b"}, {"name": "qwen3-embedding:4b"}]})
         return Response({"result": {"config": {}}})
 
     monkeypatch.setattr(rag.httpx, "get", fake_get)
@@ -138,6 +139,11 @@ def test_inspect_index_reports_documents_services_and_orphaned_sources(monkeypat
 
     assert result["qdrant"]["status"] == "healthy"
     assert result["embedding"]["status"] == "healthy"
+    assert {option["id"]: option["installed"] for option in result["embedding_options"]} == {
+        "qwen3-embedding:0.6b": True, "bge-m3": False, "qwen3-embedding:4b": True,
+    }
+    assert [option["id"] for option in result["embedding_options"] if option["selected"]] == ["qwen3-embedding:0.6b"]
+    assert result["collection"] == "support_documents_qwen3-embedding-0-6b"
     assert result["metrics"] == {
         "source_count": 3,
         "indexed_sources": 2,
@@ -193,3 +199,45 @@ def test_evaluate_query_searches_existing_index_without_syncing(monkeypatch):
     assert result["result_count"] == 1
     assert result["results"][0]["source"] == "guide.md"
     assert result["results"][0]["score"] == 0.82
+
+
+def test_large_reindexing_is_deferred_to_the_background_instead_of_blocking_the_answer(monkeypatch, tmp_path):
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text(f"contenu {name}", encoding="utf-8")
+    monkeypatch.setattr(rag.settings, "rag_documents_dir", str(tmp_path))
+    monkeypatch.setattr(rag, "_all_points", lambda: [])
+    indexed = []
+    monkeypatch.setattr(rag, "_index_source", lambda *args: indexed.append(args))
+
+    assert rag._sync_documents(max_sources=2)["deferred_sources"] == 3
+    assert indexed == []  # rien n'est indexé dans la réponse en direct
+    assert rag._sync_documents(max_sources=3)["indexed_sources"] == 3  # petit lot : fait tout de suite
+
+
+def test_retrieval_triggers_background_sync_and_answers_immediately(monkeypatch):
+    started = []
+    monkeypatch.setattr(rag, "_ensure_collection", lambda: None)
+    monkeypatch.setattr(rag, "_sync_documents", lambda **_kwargs: {"deferred_sources": 40})
+    monkeypatch.setattr(rag, "_start_background_sync", lambda: started.append(True))
+    monkeypatch.setattr(rag, "evaluate_query", lambda _query: {"results": []})
+    monkeypatch.setattr(rag, "_kb_excerpts", lambda _query: [])
+
+    assert "Aucun extrait" in rag.retrieve_context("Le service ne répond plus")
+    assert started == [True]
+
+
+def test_retrieval_does_not_wait_while_another_indexing_is_running(monkeypatch):
+    monkeypatch.setattr(rag, "_ensure_collection", lambda: None)
+    monkeypatch.setattr(
+        rag, "_sync_documents",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("ne doit pas synchroniser pendant une indexation")),
+    )
+    monkeypatch.setattr(rag, "evaluate_query", lambda _query: {"results": [
+        {"source": "guide.pdf", "page": 3, "text": "Vérifier le routage.", "score": 0.8},
+    ]})
+    monkeypatch.setattr(rag, "_kb_excerpts", lambda _query: [])
+
+    with rag._sync_lock:  # une indexation (admin ou autre ticket) tient le verrou
+        context = rag.retrieve_context("routage")
+
+    assert "[Source : guide.pdf, page 3]" in context

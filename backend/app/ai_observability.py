@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, aliased, load_only
 
 from app.auth import require_roles
 from app.ai_routing import AI_ROLES, AI_TASKS, get_routing_config, provider_catalog
+from app.rag import embedding_status, qdrant_status
 from app.database import get_db
 from app.models import AIExecution, AIModelPrice, AIRoutingConfig, Ticket, TicketEvent, User
 
@@ -56,7 +57,7 @@ class PricingUpdate(BaseModel):
 
 def record_execution(
     *,
-    ticket_id: str,
+    ticket_id: str | None,
     customer_id: str,
     actor_id: str | None,
     task: str,
@@ -112,7 +113,7 @@ def _filtered_executions(
     Actor = aliased(User)
     query = (
         select(AIExecution, Ticket.reference, Ticket.title, User.full_name, Actor.full_name)
-        .join(Ticket, AIExecution.ticket_id == Ticket.id)
+        .outerjoin(Ticket, AIExecution.ticket_id == Ticket.id)
         .join(User, AIExecution.customer_id == User.id)
         .outerjoin(Actor, AIExecution.actor_id == Actor.id)
     )
@@ -204,8 +205,8 @@ def list_traces(
         "items": [{
             "id": execution.id,
             "ticket_id": execution.ticket_id,
-            "ticket_reference": reference,
-            "ticket_title": title,
+            "ticket_reference": reference or "Console d’aide",
+            "ticket_title": title or "Conversation hors ticket",
             "customer_id": execution.customer_id,
             "customer_name": customer_name,
             "actor_id": execution.actor_id,
@@ -396,6 +397,8 @@ def ai_diagnostics(
         "routing_enabled": config["enabled"],
         "providers": providers,
         "routes": routes,
+        "embedding": embedding_status(),
+        "rag": qdrant_status(),
         "recent_failures": recent_failures,
         "ticket": ticket_diagnostic,
     }
@@ -495,8 +498,8 @@ def list_costs(
         items.append({
             "id": execution.id,
             "ticket_id": execution.ticket_id,
-            "ticket_reference": reference,
-            "ticket_title": title,
+            "ticket_reference": reference or "Console d’aide",
+            "ticket_title": title or "Conversation hors ticket",
             "customer_id": execution.customer_id,
             "customer_name": customer_name,
             "actor_id": execution.actor_id,
@@ -542,6 +545,8 @@ def get_pricing(
     models = sorted(set(used_models) | set(configured_models) | set(rates))
     return {
         "currency": "USD",
+        # Modèles de génération détectés par fournisseur, pour les listes déroulantes.
+        "available_models": {item["id"]: item["available_models"] for item in provider_catalog()},
         "prices": [{
             "provider": provider,
             "model": model,

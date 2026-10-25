@@ -1,4 +1,5 @@
 import hashlib
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -62,31 +63,54 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
     email = payload.email.lower()
     if db.scalar(select(User).where(User.email == email)):
         raise HTTPException(status_code=409, detail="Cette adresse e-mail est déjà utilisée.")
-    company = db.scalar(
-        select(Company).where(
-            Company.invitation_code_hash == hashlib.sha256(payload.company_code.encode()).hexdigest(),
-            Company.is_active.is_(True),
+    company = None
+    if payload.account_type == "company":
+        company = db.scalar(
+            select(Company).where(
+                Company.invitation_code_hash == hashlib.sha256(payload.company_code.encode()).hexdigest(),
+                Company.is_active.is_(True),
+                Company.is_individual.is_(False),
+            )
         )
-    )
-    if not company:
-        raise HTTPException(status_code=400, detail="Code d’entreprise invalide ou entreprise inactive.")
+        if not company:
+            raise HTTPException(status_code=400, detail="Code d’entreprise invalide ou entreprise inactive.")
     user = User(
         email=email,
         full_name=payload.full_name.strip(),
         password_hash=hash_password(payload.password),
         role="customer",
-        company_id=company.id,
+        company_id=company.id if company else None,
         account_status="pending",
         ai_processing_consent=payload.ai_processing_consent,
         ai_trace_consent=payload.ai_trace_consent,
         ai_consent_updated_at=utcnow(),
     )
     db.add(user)
+    if payload.account_type == "independent":
+        db.flush()
+        user.company_id = _create_individual_company(db, user).id
     db.commit()
     return RegistrationOut(
         status="pending",
         message="Votre demande d’accès a été transmise au support. Vous pourrez vous connecter après validation.",
     )
+
+
+def _create_individual_company(db: Session, user: User) -> Company:
+    """Entreprise individuelle d'un client indépendant : nom unique, aucun code d'invitation utilisable."""
+    base = f"{user.full_name} (indépendant)"
+    name, suffix = base, 2
+    while db.scalar(select(Company).where(Company.name.ilike(name))):
+        name, suffix = f"{base} {suffix}", suffix + 1
+    company = Company(
+        name=name,
+        invitation_code_hash=hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
+        created_by_id=user.id,
+        is_individual=True,
+    )
+    db.add(company)
+    db.flush()
+    return company
 
 
 @router.post("/login", response_model=TokenResponse)

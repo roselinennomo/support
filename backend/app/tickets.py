@@ -12,15 +12,17 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.ai import AIRoutingDisabledError, AIAnalysisError, assist_agent, respond_to_customer
+from app.ai_routing import ModelSelection, resolve_selection, routing_role
 from app.auth import get_current_user, require_roles
 from app.config import settings
+from app.kb import flags as kb_flags
+from app.kb.jobs import enqueue_ticket_enrichment
 from app.database import SessionLocal, get_db
 from app.models import Company, Message, Ticket, TicketAttachment, TicketEvent, User, company_agents
 from app.schemas import (
     AssignmentUpdate,
     AgentAIAssist,
     BackgroundAccepted,
-    EscalationCreate,
     HandoffCreate,
     MessageCreate,
     StatusUpdate,
@@ -45,7 +47,6 @@ STAFF_STATUS_TRANSITIONS = {
     "waiting_customer": {"new", "in_progress", "waiting_support", "resolved", "rejected"},
     "escalated": {"in_progress", "waiting_support", "waiting_customer", "resolved", "rejected"},
 }
-ESCALATION_SOURCE_STATUSES = {"new", "in_progress", "waiting_support", "waiting_customer"}
 TERMINAL_STATUSES = {"closed", "rejected"}
 CUSTOMER_REPLY_STATUSES = {"new", "in_progress", "waiting_support", "waiting_customer", "escalated", "resolved"}
 ALLOWED_ATTACHMENT_EXTENSIONS = {".csv", ".jpg", ".jpeg", ".log", ".pdf", ".pcap", ".png", ".txt", ".webp", ".zip"}
@@ -92,18 +93,34 @@ def _has_customer_ai_exchange(ticket: Ticket) -> bool:
         None,
     )
     return first_ai_response_index is not None and any(
-        message.author_id == ticket.customer_id and message.visibility == "public"
+        message.author.role == "customer" and message.visibility == "public"
         for message in messages[first_ai_response_index + 1:]
     )
 
 
 def _ticket_or_404(db: Session, ticket_id: str, user: User) -> Ticket:
     ticket = db.get(Ticket, ticket_id)
-    if not ticket or (user.role == "customer" and ticket.customer_id != user.id):
+    if not ticket or (user.role == "customer" and not _customer_can_access(ticket, user)):
         raise HTTPException(status_code=404, detail="Incident introuvable.")
     if user.role == "agent" and not _agent_can_access_company(db, user, ticket.customer.company_id):
         raise HTTPException(status_code=404, detail="Incident introuvable.")
     return ticket
+
+
+def _validated_preference(db: Session, user: User, selection: ModelSelection | None) -> dict | None:
+    if selection is None:
+        return None
+    try:
+        return resolve_selection(db, routing_role(user.role), selection)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _customer_can_access(ticket: Ticket, user: User) -> bool:
+    """Un client voit ses tickets et ceux de ses collègues de la même entreprise."""
+    if ticket.customer_id == user.id:
+        return True
+    return bool(user.company_id) and ticket.customer.company_id == user.company_id
 
 
 def _agent_can_access_company(db: Session, agent: User, company_id: str | None) -> bool:
@@ -147,6 +164,8 @@ def _conversation_context(ticket_id: str, include_internal: bool) -> tuple[Simpl
             description=ticket.description,
             product=ticket.product,
             version=ticket.version,
+            ai_preferences=ticket.ai_preferences,
+            company_id=ticket.customer.company_id,
         )
         messages = sorted(ticket.messages, key=lambda message: message.created_at)
         conversation = [
@@ -188,7 +207,8 @@ def _run_customer_ai(ticket_id: str) -> None:
             if not ticket or ticket.status != "ai_triage":
                 return
             assistant = _assistant_user(db)
-            ticket.priority = result["priority"]
+            if result["priority"]:  # None : l'IA n'a pas fourni de priorité exploitable, on garde celle du client
+                ticket.priority = result["priority"]
             ticket.ai_summary = result["reply"]
             ticket.ai_recommendations = result["recommendations"]
             ticket.ai_escalation_recommended = result["escalation_recommended"]
@@ -245,12 +265,65 @@ def _run_customer_ai(ticket_id: str) -> None:
             db.commit()
 
 
-def _run_agent_ai(ticket_id: str, question: str, actor_id: str) -> None:
+TICKET_SUMMARY_QUESTION = (
+    "Résume ce ticket pour l'équipe support : contexte et symptômes, périmètre impacté, "
+    "vérifications déjà réalisées, état actuel et prochaines étapes de diagnostic sûres et priorisées. "
+    "Distingue les faits confirmés des hypothèses, n'invente aucun fait, indique les informations "
+    "manquantes et cite les sources documentaires utilisées si elles sont disponibles. Réponds en français."
+)
+
+
+def recover_stuck_ai_tickets(session_factory=None, background: bool = True) -> int:
+    """Relance le diagnostic IA des tickets restés « en réflexion » (redémarrage de l'API en cours de tâche).
+
+    Les tâches de fond vivent dans le processus : un redémarrage les perd et le ticket resterait
+    indéfiniment en attente (le client ne pourrait ni répondre ni transférer).
+    """
+    factory = session_factory or SessionLocal
+    try:
+        with factory() as db:
+            ticket_ids = list(db.scalars(
+                select(Ticket.id).where(Ticket.status == "ai_triage", Ticket.ai_status == "pending")
+            ).all())
+    except Exception:
+        logger.exception("Could not look for stuck AI tickets")
+        return 0
+
+    def run_all() -> None:
+        for ticket_id in ticket_ids:
+            _run_customer_ai(ticket_id)  # gère et journalise ses propres erreurs
+
+    if ticket_ids:
+        logger.warning("Relance du diagnostic IA de %s ticket(s) interrompu(s)", len(ticket_ids))
+        if background:
+            import threading
+
+            threading.Thread(target=run_all, name="ai-recovery", daemon=True).start()
+        else:
+            run_all()
+    return len(ticket_ids)
+
+
+def _run_agent_ai(
+    ticket_id: str,
+    question: str,
+    actor_id: str,
+    preference: dict | None = None,
+    summary: bool = False,
+) -> None:
     try:
         ticket_snapshot, conversation, attachment_names = _conversation_context(ticket_id, include_internal=True)
         if not ticket_snapshot.ai_processing_consent:
             raise AIAnalysisError("Le client n’a pas consenti à l’analyse IA de son ticket.")
-        answer = assist_agent(ticket_snapshot, conversation, attachment_names, question, actor_id=actor_id)
+        answer = assist_agent(
+            ticket_snapshot,
+            conversation,
+            attachment_names,
+            TICKET_SUMMARY_QUESTION if summary else question,
+            task="handoff_summary" if summary else "agent_assistance",
+            actor_id=actor_id,
+            preference=preference,
+        )
         with SessionLocal() as db:
             ticket = db.get(Ticket, ticket_id)
             actor = db.get(User, actor_id)
@@ -469,6 +542,7 @@ def _serialize(ticket: Ticket, user: User) -> dict:
         "ai_recommendations": ticket.ai_recommendations,
         "ai_escalation_recommended": ticket.ai_escalation_recommended,
         "ai_error": ticket.ai_error if user.role != "customer" else "",
+        "ai_preferences": ticket.ai_preferences,
         "resolution_note": ticket.resolution_note,
         "rejection_reason": ticket.rejection_reason,
         "escalation_team": ticket.escalation_team,
@@ -511,6 +585,7 @@ def create_ticket(
         "p4": "low",
     }.get(payload.priority, payload.priority)
     ai_enabled_for_customer = user.ai_processing_consent
+    ai_preferences = _validated_preference(db, user, payload.ai_model)
     ticket = Ticket(
         reference=f"OXE-{uuid4().hex[:8].upper()}",
         customer_id=user.id,
@@ -523,6 +598,7 @@ def create_ticket(
         status="ai_triage" if ai_enabled_for_customer else "new",
         ai_status="pending" if ai_enabled_for_customer else "disabled",
         ai_provider="",
+        ai_preferences=ai_preferences,
     )
     db.add(ticket)
     db.flush()
@@ -540,6 +616,9 @@ def create_ticket(
     db.commit()
     if ai_enabled_for_customer:
         background_tasks.add_task(_run_customer_ai, ticket.id)
+        # Les tâches de fond s'exécutent à la suite : l'enrichissement KB ne démarre qu'après la
+        # première réponse IA, sans la ralentir ni ajouter de latence à la création du ticket.
+        background_tasks.add_task(enqueue_ticket_enrichment, ticket.id)
     db.refresh(ticket)
     return _serialize(ticket, user)
 
@@ -548,12 +627,16 @@ def create_ticket(
 def list_tickets(
     status_filter: str | None = Query(default=None, alias="status"),
     search: str | None = Query(default=None, max_length=100),
+    limit: int = Query(default=200, ge=1, le=1000),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     query = select(Ticket)
     if user.role == "customer":
-        query = query.where(Ticket.customer_id == user.id)
+        if user.company_id:
+            query = query.join(User, Ticket.customer_id == User.id).where(User.company_id == user.company_id)
+        else:
+            query = query.where(Ticket.customer_id == user.id)
     elif user.role == "agent":
         query = query.join(User, Ticket.customer_id == User.id).join(
             company_agents, company_agents.c.company_id == User.company_id
@@ -567,7 +650,7 @@ def list_tickets(
     if search:
         term = f"%{search.strip()}%"
         query = query.where(or_(Ticket.reference.ilike(term), Ticket.title.ilike(term), Ticket.product.ilike(term)))
-    tickets = db.scalars(query.order_by(Ticket.updated_at.desc()).limit(200)).all()
+    tickets = db.scalars(query.order_by(Ticket.updated_at.desc()).limit(limit)).all()
     return [_serialize(ticket, user) for ticket in tickets]
 
 
@@ -673,8 +756,47 @@ def request_agent_ai_assistance(
             status_code=409,
             detail="Le client n’a pas consenti à l’analyse IA de ce ticket.",
         )
-    background_tasks.add_task(_run_agent_ai, ticket.id, payload.question.strip(), user.id)
+    preference = _validated_preference(db, user, payload.ai_model)
+    background_tasks.add_task(
+        _run_agent_ai, ticket.id, payload.question.strip(), user.id, preference, payload.kind == "summary",
+    )
     return BackgroundAccepted(status="pending")
+
+
+@router.post("/{ticket_id}/kb-enrich", response_model=BackgroundAccepted, status_code=202)
+def request_kb_enrichment(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("agent", "admin")),
+):
+    """Relance à la demande la recherche dans la KB constructeur pour ce ticket."""
+    ticket = _ticket_or_404(db, ticket_id, user)
+    if not ticket.customer.ai_processing_consent:
+        raise HTTPException(status_code=409, detail="Le client n’a pas consenti à l’analyse IA de ce ticket.")
+    if not kb_flags.is_enabled():
+        raise HTTPException(status_code=409, detail="L’enrichissement par la KB constructeur est désactivé.")
+    return BackgroundAccepted(status="queued" if enqueue_ticket_enrichment(ticket.id) else "ignored")
+
+
+@router.put("/{ticket_id}/ai-preferences", response_model=TicketOut)
+def set_ai_preferences(
+    ticket_id: str,
+    payload: ModelSelection,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("customer")),
+):
+    ticket = _ticket_or_404(db, ticket_id, user)
+    if ticket.status in TERMINAL_STATUSES:
+        raise HTTPException(status_code=409, detail="Cette demande est clôturée.")
+    ticket.ai_preferences = _validated_preference(db, user, payload)
+    _event(db, ticket, user, "ai_model_selected", {
+        "provider": ticket.ai_preferences["provider"],
+        "model": ticket.ai_preferences["model"],
+        "think": ticket.ai_preferences["think"],
+    })
+    db.commit()
+    db.refresh(ticket)
+    return _serialize(ticket, user)
 
 
 @router.post("/{ticket_id}/attachments", response_model=TicketOut)
@@ -835,31 +957,6 @@ def update_status(
     return _serialize(ticket, user)
 
 
-@router.post("/{ticket_id}/escalate", response_model=TicketOut)
-def escalate(
-    ticket_id: str, payload: EscalationCreate, db: Session = Depends(get_db),
-    user: User = Depends(require_roles("agent", "admin")),
-):
-    ticket = _ticket_or_404(db, ticket_id, user)
-    if ticket.status not in ESCALATION_SOURCE_STATUSES:
-        raise HTTPException(status_code=409, detail=f"Impossible d’escalader un ticket au statut {ticket.status}.")
-    previous = ticket.status
-    ticket.status = "escalated"
-    ticket.escalation_team = payload.team.strip()
-    ticket.escalation_reason = payload.reason.strip()
-    ticket.external_reference = payload.external_reference.strip()
-    ticket.updated_at = datetime.now(timezone.utc)
-    _event(db, ticket, user, "escalated", {
-        "team": ticket.escalation_team,
-        "reason": ticket.escalation_reason,
-        "external_reference": ticket.external_reference,
-        "from": previous,
-    })
-    db.commit()
-    db.refresh(ticket)
-    return _serialize(ticket, user)
-
-
 @router.patch("/{ticket_id}/assignment", response_model=TicketOut)
 def assign_ticket(
     ticket_id: str, payload: AssignmentUpdate, db: Session = Depends(get_db),
@@ -871,6 +968,9 @@ def assign_ticket(
     agent = db.get(User, payload.agent_id) if payload.agent_id else None
     if payload.agent_id and (not agent or agent.role not in {"agent", "admin"} or not agent.is_active):
         raise HTTPException(status_code=422, detail="Agent indisponible ou invalide.")
+    if agent and agent.role == "admin" and user.role != "admin":
+        # Un administrateur peut prendre un ticket exceptionnellement; seul un administrateur peut le lui attribuer.
+        raise HTTPException(status_code=403, detail="Seul un administrateur peut assigner un ticket à un administrateur.")
     company_id = ticket.customer.company_id
     if agent and agent.role == "agent" and company_id:
         if not _agent_can_access_company(db, agent, company_id):

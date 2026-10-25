@@ -46,20 +46,20 @@ Le code brut est retourné uniquement lors de la création de l'entreprise; le s
 | Méthode | Route | Accès |
 |---|---|---|
 | `POST` | `/tickets` | client approuvé uniquement; crée un incident pour le client courant |
-| `GET` | `/tickets?status=new&search=OXE` | connecté; clients limités à leurs dossiers, agents à leurs entreprises, admins à tous |
-| `GET` | `/tickets/{id}` | propriétaire, agent de l'entreprise ou admin |
-| `POST` | `/tickets/{id}/conversation` | client propriétaire; message multipart et fichiers optionnels durant le diagnostic |
-| `POST` | `/tickets/{id}/handoff` | client propriétaire; transmet le diagnostic et ses pièces jointes à la file agent après une réponse du client à la première réponse publique de l'IA |
-| `POST` | `/tickets/{id}/close` | client propriétaire; confirme et clôture un ticket résolu |
+| `GET` | `/tickets?status=new&search=OXE` | connecté; clients limités aux dossiers de leur entreprise, agents à leurs entreprises, admins à tous |
+| `GET` | `/tickets/{id}` | client de l'entreprise, agent de l'entreprise ou admin |
+| `POST` | `/tickets/{id}/conversation` | client de l'entreprise; message multipart et fichiers optionnels durant le diagnostic |
+| `POST` | `/tickets/{id}/handoff` | client de l'entreprise; transmet le diagnostic et ses pièces jointes à la file agent après une réponse d'un client à la première réponse publique de l'IA |
+| `POST` | `/tickets/{id}/close` | client de l'entreprise; confirme et clôture un ticket résolu |
 | `POST` | `/tickets/{id}/ai-assist` | agent/admin; demande une aide IA privée, réponse asynchrone `202` |
-| `POST` | `/tickets/{id}/attachments` | propriétaire, agent de l'entreprise ou admin; ajout de pièces jointes |
-| `GET` | `/tickets/{id}/attachments/{attachment_id}` | propriétaire, agent de l'entreprise ou admin; téléchargement protégé |
-| `POST` | `/tickets/{id}/messages` | propriétaire, agent de l'entreprise ou admin; visibilité `public` ou `internal` (agents uniquement pour interne) |
+| `POST` | `/tickets/{id}/attachments` | client de l'entreprise, agent de l'entreprise ou admin; ajout de pièces jointes |
+| `GET` | `/tickets/{id}/attachments/{attachment_id}` | client de l'entreprise, agent de l'entreprise ou admin; téléchargement protégé |
+| `POST` | `/tickets/{id}/messages` | client de l'entreprise, agent de l'entreprise ou admin; visibilité `public` ou `internal` (agents uniquement pour interne) |
 | `PATCH` | `/tickets/{id}/status` | agent de l'entreprise ou admin; transitions contrôlées, note de résolution ou motif de rejet requis |
 | `POST` | `/tickets/{id}/escalate` | agent de l'entreprise ou admin |
-| `PATCH` | `/tickets/{id}/assignment` | agent de l'entreprise ou admin; l'agent assigné doit être affecté à la même entreprise |
+| `PATCH` | `/tickets/{id}/assignment` | agent de l'entreprise ou admin; l'agent assigné doit être affecté à la même entreprise; assigner à un administrateur est réservé aux administrateurs (403 sinon); un client n'est jamais assignable (422) |
 
-Les recherches renvoient au plus 200 tickets, triés par dernière activité décroissante. Un statut incorrect produit une erreur de validation. Une ressource privée ou inconnue renvoie `404` afin de ne pas révéler son existence.
+`GET /tickets` accepte `limit` (défaut 200, maximum 1000); l'interface charge jusqu'à 1000 incidents et les pagine côté client. Les traces et coûts IA se paginent côté serveur (`limit`, `offset`), de même que les recherches KB (`GET /admin/kb` : `jobs_limit` ≤ 100, `jobs_offset`, `jobs_status`; réponse `jobs_total` et `job_counts` par statut; `GET /admin/kb/debug` : `limit`, `offset`, `job_id` pour ouvrir une recherche hors de la page courante, réponse `jobs_total` et `focused_job`). Les clients d'une même entreprise voient et peuvent compléter les tickets de leurs collègues (les notes internes restent masquées); un client d'une autre entreprise reçoit `404`. Le consentement IA appliqué à un ticket reste celui de son auteur. Les recherches renvoient au plus 200 tickets, triés par dernière activité décroissante. Un statut incorrect produit une erreur de validation. Une ressource privée ou inconnue renvoie `404` afin de ne pas révéler son existence.
 
 ### Champs principaux
 
@@ -100,15 +100,7 @@ L'assistance agent s'utilise avec `POST /tickets/{id}/ai-assist` :
 
 La réponse `202 {"status":"pending"}` signifie que le traitement est lancé. La réponse de l'IA apparaît ensuite comme un message `internal`, visible uniquement par les agents et administrateurs. Le modèle reçoit tout l'historique, y compris les notes internes, et les noms des pièces jointes; il n'en lit pas le contenu.
 
-Escalade :
-
-```json
-{
-  "team": "Expertise OXE",
-  "reason": "Analyse approfondie nécessaire après vérifications initiales.",
-  "external_reference": "EXP-1042"
-}
-```
+Il n'existe pas d'escalade manuelle entre agents (`POST /tickets/{id}/escalate` supprimée, le statut `escalated` n'est plus assignable) : l'escalade est le transfert de l'IA vers le support (`POST /tickets/{id}/handoff`). Les tickets déjà `escalated` restent lisibles et peuvent changer de statut.
 
 ## SLA, rapports et facturation
 
@@ -147,6 +139,10 @@ Les factures PDF sont des documents de relevé à compléter par les information
 
 Le mot de passe est fourni comme `{"temporary_password":"..."}` (10 caractères minimum), stocké sous forme de hachage et jamais retourné par l'API; la réinitialisation invalide les sessions en cours du compte. Les opérations de modification et de réinitialisation sont inscrites dans `user_admin_audit` sans enregistrer de mot de passe. Un agent ne peut pas modifier son propre compte via cette console, gérer les admins, ni agir sur des utilisateurs d’une entreprise non affectée. Le dernier admin actif ne peut pas être désactivé ni rétrogradé.
 
+## Enrichissement par la KB constructeur
+
+Les jobs retournés par `GET /admin/kb` et `GET /admin/kb/debug` incluent `ticket_reference`, `ticket_title` et `results` (une entrée par résultat : `source` `kb`/`document`, `status` `new`/`known`/`duplicate`/`filtered`/`empty`/`failed`, `title`, `url`, `detail`). Routes `/admin/kb`, `/admin/kb/settings`, `/admin/kb/session/check`, `/admin/kb/debug`, `/admin/kb/reindex` (admin) et `POST /tickets/{id}/kb-enrich` (agent/admin) : voir `docs/kb-scraper.md`. `GET /ai/options` retourne `kb_enabled` aux agents et admins.
+
 ## Routage des modèles IA
 
 L'administration du routage est réservée aux admins. La configuration est stockée en base de données et appliquée aux nouveaux appels sans redémarrage de l'API.
@@ -155,9 +151,30 @@ L'administration du routage est réservée aux admins. La configuration est stoc
 |---|---|---|---|
 | `GET` | `/admin/ai-routing` | admin | Configuration courante, tâches, rôles et état/catalogue des fournisseurs. |
 | `PUT` | `/admin/ai-routing` | admin | Enregistre l’interrupteur général et les affectations modèle/priorité par tâche et rôle. |
-| `GET` | `/admin/ai/diagnostics` | admin | État/catalogue des fournisseurs, règles de routage et derniers échecs; `reference` ajoute l’historique de diagnostic d’un ticket sans exposer prompts ni réponses. |
+| `DELETE` | `/admin/ai-routing` | admin | Supprime la configuration enregistrée; les valeurs par défaut de l’environnement (`OLLAMA_MODEL`, `OLLAMA_THINK`, `OLLAMA_TIMEOUT_SECONDS`) s’appliquent de nouveau. Retourne la configuration résultante. |
+| `GET` | `/ai/options` | connecté | Modèles que l’utilisateur peut choisir (`models` : `provider`, `model`, `supports_think`, `think` par défaut) et modèle par défaut (`default`) de son rôle, d’après les affectations de l’admin. |
+| `PUT` | `/tickets/{id}/ai-preferences` | client de l’entreprise | Choisit le modèle (et `think`) du diagnostic du ticket : `{"provider","model","think"}`. `think` omis = valeur de l’admin. `422` si le modèle n’est pas affecté aux clients. |
+| `GET` | `/admin/ai/diagnostics` | admin | État/catalogue des fournisseurs, règles de routage, derniers échecs, instance Ollama d'embeddings (`embedding` : modèle actif, dimension, collection, modèles installés) et état de Qdrant (`rag`); `reference` ajoute l’historique de diagnostic d’un ticket sans exposer prompts ni réponses. |
 
 Les tâches sont `customer_diagnosis`, `agent_assistance`, `handoff_summary` et `ticket_analysis`; les rôles configurables sont `customer` et `staff` (agent/admin). Chaque règle activée nécessite au moins un modèle. Un maximum de quatre couples fournisseur/modèle peut être ordonné par règle; en cas d’échec, le serveur tente le suivant. Le service accepte les fournisseurs `ollama` et `anthropic`; les modèles Ollama personnalisés doivent déjà être installés sur Ollama, et Anthropic nécessite une clé API configurée. Le bouton général met en pause toute génération IA sans effacer les affectations; au moins une règle avec un modèle doit rester configurée pour enregistrer.
+
+Chaque affectation accepte deux options facultatives :
+
+```json
+{ "provider": "ollama", "model": "deepseek-r1:1.5b", "think": false, "timeout_seconds": 120 }
+```
+
+- `think` (défaut `false`, Ollama uniquement) : active le raisonnement interne des modèles « thinking » (qwen3, deepseek-r1…). Sur CPU, il peut multiplier le temps de réponse par 10 ou plus (plus de 10 minutes mesurées pour un ticket avec qwen3:4b).
+- `timeout_seconds` (défaut `120`, de `10` à `1800`) : délai maximum de l'appel au fournisseur avant de passer au modèle suivant.
+
+Les configurations enregistrées avant l'introduction de ces options reçoivent automatiquement les valeurs par défaut.
+
+### Choix du modèle par les utilisateurs
+
+Le premier modèle de chaque règle est le modèle par défaut; l’utilisateur ne peut choisir que parmi les modèles que l’admin a affectés à son rôle (`customer` ou `staff`, toutes tâches actives confondues), jamais un identifiant libre. Le modèle choisi passe en tête de la priorité et les autres restent en secours; le délai maximal reste celui de l’admin. `think` n’est pris en compte que pour Ollama.
+
+- **Client** : `POST /tickets` accepte `ai_model` (`{"provider","model","think"}`) et `PUT /tickets/{id}/ai-preferences` le modifie; le choix est conservé dans `ai_preferences` et utilisé pour l’analyse initiale et le diagnostic (tâches `ticket_analysis` et `customer_diagnosis`). Le résumé de transfert interne reste sur le routage de l’admin.
+- **Agent/admin** : `POST /tickets/{id}/ai-assist` accepte `ai_model` et `kind`. `kind: "question"` (défaut) exige `question`; `kind: "summary"` génère le résumé du ticket (tâche `handoff_summary`, rôle `staff`) sans question.
 Les échecs individuels des fournisseurs sont journalisés comme événements techniques du ticket (tâche, fournisseur, modèle, durée et message d’erreur), y compris si un modèle de secours répond ensuite. Ces événements ne conservent pas le prompt ou la réponse.
 
 Le RAG documentaire et ses embeddings Ollama ne sont pas désactivés par cet interrupteur et ne font pas partie du routage des LLM de génération.
@@ -173,7 +190,7 @@ Les comptes client disposent de deux consentements distincts, activés par défa
 | `GET` | `/admin/ai/traces` | admin | Liste paginée des appels consentis avec prompts/réponses, tokens, durée, fournisseur, ticket et acteurs. Filtres : `ticket_id`, `customer_id`, `actor_id`, `provider`, `model`, `task`, `start`, `end`; `limit` (max 200) et `offset`. |
 | `PATCH` | `/admin/ai/traces/{execution_id}` | admin | Enregistre une note d’évaluation de 1 à 5 et un commentaire. |
 | `GET` | `/admin/ai/costs` | admin | Détail paginé et coût estimé, filtrable par ticket, client, utilisateur, fournisseur, modèle, tâche et période. |
-| `GET` / `PUT` | `/admin/ai/pricing` | admin | Lit ou met à jour les tarifs en USD par million de tokens entrée/sortie. |
+| `GET` / `PUT` | `/admin/ai/pricing` | admin | Lit ou met à jour les tarifs en USD par million de tokens entrée/sortie; la lecture retourne aussi `available_models` (modèles de génération détectés par fournisseur) pour les listes déroulantes. |
 
 Le refus du traitement IA empêche les nouveaux appels sur le ticket; l’assistance humaine reste possible. Le refus de conservation des traces n’empêche pas le traitement IA si son consentement séparé reste activé : seuls les métadonnées, tokens et coûts restent enregistrés, sans contenu conversationnel. Le contenu de trace est automatiquement purgé après 30 jours. Les tarifs sont des estimations recalculées avec les prix administrés; les modèles Anthropic sans tarif configuré sont indiqués comme non tarifés. Ollama local est estimé à 0 USD de coût fournisseur.
 
@@ -183,13 +200,15 @@ Toutes les routes de gestion du corpus sont réservées aux administrateurs. Ell
 
 | Méthode | Route | Accès | Résultat |
 |---|---|---|---|
-| `GET` | `/admin/rag` | admin | État Qdrant et embeddings, métriques du corpus, documents, sources supprimées, limites d'upload et état de la dernière synchronisation. |
+| `GET` | `/admin/rag` | admin | État Qdrant et embeddings, métriques du corpus, documents, sources supprimées, limites d'upload, état de la dernière synchronisation et `embedding_options` (modèles proposés : `installed`, `selected`, `dimension`). |
+| `PUT` | `/admin/rag/embedding-model` | admin | Choisit le modèle d'embedding (`{"model":"bge-m3"}`, parmi `qwen3-embedding:0.6b`, `bge-m3`, `qwen3-embedding:4b`) et lance la réindexation (`202`). `409` si le modèle n'est pas téléchargé ou si une indexation est en cours, `422` s'il n'est pas pris en charge. |
+| `DELETE` | `/admin/rag/documents` | admin | Supprime des documents : corps `{"names":["guide.md", ...]}` (chemins relatifs du corpus). Retourne `deleted` et `index_updated` (`false` si Qdrant est indisponible : l'index sera nettoyé à la prochaine synchronisation). `404` (aucune suppression) si un nom est inconnu ou hors du corpus, `409` pendant une indexation. |
 | `GET` | `/admin/rag/index` | admin | État détaillé et progression de l’indexation en cours (route légère pour le suivi périodique). |
 | `POST` | `/admin/rag/documents` | admin | Téléverse des fichiers avec le champ multipart `files`; extensions `.pdf`, `.md`, `.markdown`, `.txt`. |
 | `POST` | `/admin/rag/index` | admin | Lance une synchronisation incrémentale en tâche de fond et retourne `202 {"status":"pending"}`. |
 | `POST` | `/admin/rag/search` | admin | Teste une requête sur l'index existant sans synchroniser ni modifier le corpus. |
 
-L'envoi accepte au maximum `MAX_ATTACHMENTS_PER_UPLOAD` fichiers, chacun limité par `MAX_ATTACHMENT_SIZE`. Un nom déjà présent provoque `409`; un type non pris en charge provoque `415`. L'indexation met à jour les sources modifiées, ajoute les nouvelles et supprime les sources absentes du dossier. Son état et son résultat sont disponibles via `GET /admin/rag`; comme les autres tâches de fond FastAPI du projet, ce suivi en mémoire n'est pas durable et ne survit pas au redémarrage du processus.
+Le téléversement du corpus accepte au maximum `RAG_MAX_FILES_PER_UPLOAD` fichiers (50 par défaut), chacun limité par `RAG_MAX_FILE_SIZE` (50 Mio par défaut); les pièces jointes de tickets restent limitées par `MAX_ATTACHMENTS_PER_UPLOAD` et `MAX_ATTACHMENT_SIZE`. Dépasser ces limites renvoie `413`; nginx doit aussi autoriser la taille totale (voir `operations.md`). Un nom déjà présent provoque `409`; un type non pris en charge provoque `415`. L'indexation met à jour les sources modifiées, ajoute les nouvelles et supprime les sources absentes du dossier. Son état et son résultat sont disponibles via `GET /admin/rag`; comme les autres tâches de fond FastAPI du projet, ce suivi en mémoire n'est pas durable et ne survit pas au redémarrage du processus.
 
 Exemple de recherche de contrôle :
 
@@ -200,6 +219,26 @@ Exemple de recherche de contrôle :
 La réponse donne les extraits, leur source/page et leur score de similarité. Cette route recherche uniquement dans l'index courant; elle n'indexe pas les documents en attente. La synchronisation automatique lors d'une demande d'assistance reste active.
 
 L'inscription publique ne peut pas définir un rôle interne ou créer directement un compte approuvé.
+
+## Clients indépendants
+
+`POST /api/auth/register` accepte `account_type` : `company` (défaut, `company_code` obligatoire) ou `independent` (entreprise individuelle créée, compte en attente). `UserOut.is_individual` et `CompanyOut.is_individual` l'indiquent; `POST /api/companies/{id}/invitation-code` répond 409 pour une entreprise individuelle. Voir `independent-clients.md`.
+
+## Console d'aide
+
+Réservée aux rôles `admin`, `agent` et aux clients indépendants (périmètre = leur entreprise); chaque conversation n'est visible que de son propriétaire. Voir `help-console.md`.
+
+| Route | Rôle |
+| --- | --- |
+| `GET /api/help/options` | Entreprises sélectionnables, modèles IA, disponibilité de la recherche live et du web. |
+| `GET /api/help/conversations?q=&limit=&offset=` | Conversations du propriétaire, paginées (`total_count`). |
+| `POST /api/help/conversations` | Crée une conversation : `company_id` ou `ticket_id` (impose l'entreprise du ticket), `use_kb_live`, `use_web`, `model`. 404 si l'entreprise/ticket n'est pas accessible, 409 si option indisponible ou consentement IA refusé. |
+| `GET/PATCH/DELETE /api/help/conversations/{id}` | Détail avec messages; `PATCH` : `title`, `use_kb_live`, `use_web`, `model`, `refresh_ticket`. |
+| `POST /api/help/conversations/{id}/messages` | Ajoute une question (202) et lance la réponse en tâche de fond; 409 si une réponse est déjà en attente. Les messages assistant ont `status` `pending`, `done` ou `error`, `sources` (`kind` : `doc`, `company`, `kb`, `web`). |
+
+`POST /api/help/conversations/{id}/files` (multipart `files`, 201) ajoute des fichiers au contexte et `DELETE /api/help/conversations/{id}/files/{file_id}` en retire un; le détail d'une conversation liste `files` et chaque message porte `thinking`.
+
+`ai_executions.ticket_id` est facultatif : les appels de la console y sont mesurés sans ticket.
 
 ## Modèle logique
 

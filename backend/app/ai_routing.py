@@ -17,9 +17,17 @@ AI_TASKS = {
 AI_ROLES = {"customer": "Client", "staff": "Équipe support"}
 
 
+DEFAULT_TIMEOUT_SECONDS = 120
+MAX_TIMEOUT_SECONDS = 1800
+
+
 class ModelChoice(BaseModel):
     provider: Literal["ollama", "anthropic"]
     model: str = Field(min_length=1, max_length=200)
+    # Raisonnement interne des modèles « thinking » (Ollama uniquement) : désactivé par défaut car il
+    # multiplie le temps de génération sur CPU sans améliorer sensiblement le diagnostic.
+    think: bool = False
+    timeout_seconds: int = Field(default=DEFAULT_TIMEOUT_SECONDS, ge=10, le=MAX_TIMEOUT_SECONDS)
 
     @model_validator(mode="after")
     def trim_model_name(self):
@@ -63,18 +71,62 @@ class AIRoutingUpdate(BaseModel):
         return self
 
 
-def _default_model_choice() -> dict[str, str]:
+def _default_model_choice() -> dict:
     provider = settings.ai_provider.lower()
     if provider == "anthropic" and settings.anthropic_api_key:
-        return {"provider": "anthropic", "model": settings.anthropic_model}
-    return {"provider": "ollama", "model": settings.ollama_model}
+        return {
+            "provider": "anthropic",
+            "model": settings.anthropic_model,
+            "think": False,
+            "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+        }
+    return {
+        "provider": "ollama",
+        "model": settings.ollama_model,
+        "think": settings.ollama_think,
+        "timeout_seconds": min(max(settings.ollama_timeout_seconds, 10), MAX_TIMEOUT_SECONDS),
+    }
+
+
+def normalize_choice(choice: dict) -> dict:
+    """Complète les affectations enregistrées avant l'ajout des options think/timeout."""
+    return {
+        **choice,
+        "think": bool(choice.get("think", False)),
+        "timeout_seconds": int(choice.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS),
+    }
+
+
+def _normalized_routes(routes: dict) -> dict:
+    return {
+        task: {
+            role: {**route, "models": [normalize_choice(choice) for choice in route.get("models", [])]}
+            for role, route in role_routes.items()
+        }
+        for task, role_routes in routes.items()
+    }
+
+
+def _default_model_choices() -> list[dict]:
+    """Modèle principal, puis les modèles Ollama supplémentaires (sans raisonnement par défaut)."""
+    primary = _default_model_choice()
+    choices = [primary]
+    if primary["provider"] == "ollama":
+        for model in settings.ollama_extra_models.split():
+            if model != primary["model"] and len(choices) < 4:
+                choices.append({
+                    "provider": "ollama",
+                    "model": model,
+                    "think": False,
+                    "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+                })
+    return choices
 
 
 def default_routes() -> dict[str, dict[str, dict]]:
-    choice = _default_model_choice()
     return {
         task: {
-            role: {"enabled": True, "models": [dict(choice)]}
+            role: {"enabled": True, "models": [dict(choice) for choice in _default_model_choices()]}
             for role in AI_ROLES
         }
         for task in AI_TASKS
@@ -85,7 +137,7 @@ def get_routing_config(db: Session) -> dict:
     record = db.get(AIRoutingConfig, 1)
     if not record:
         return {"enabled": True, "routes": default_routes()}
-    return {"enabled": record.enabled, "routes": record.routes}
+    return {"enabled": record.enabled, "routes": _normalized_routes(record.routes)}
 
 
 def save_routing_config(db: Session, payload: AIRoutingUpdate) -> dict:
@@ -107,10 +159,121 @@ def save_routing_config(db: Session, payload: AIRoutingUpdate) -> dict:
         db.add(record)
     db.commit()
     db.refresh(record)
-    return {"enabled": record.enabled, "routes": record.routes}
+    return {"enabled": record.enabled, "routes": _normalized_routes(record.routes)}
 
 
-def routing_for(task: str, role: str) -> tuple[bool, list[dict[str, str]]]:
+def reset_routing_config(db: Session) -> dict:
+    """Supprime la configuration enregistrée : les valeurs par défaut de l'environnement s'appliquent."""
+    record = db.get(AIRoutingConfig, 1)
+    if record:
+        db.delete(record)
+        db.commit()
+    return get_routing_config(db)
+
+
+class ModelSelection(BaseModel):
+    """Modèle choisi par un utilisateur parmi ceux que l'administrateur a affectés à son rôle."""
+
+    provider: Literal["ollama", "anthropic"]
+    model: str = Field(min_length=1, max_length=200)
+    think: bool | None = None
+
+    @model_validator(mode="after")
+    def trim_model_name(self):
+        self.model = self.model.strip()
+        if not self.model:
+            raise ValueError("Le nom du modèle ne peut pas être vide.")
+        return self
+
+
+# Tâche dont la première affectation sert de modèle par défaut proposé à chaque rôle.
+ROLE_DEFAULT_TASK = {"customer": "customer_diagnosis", "staff": "agent_assistance"}
+
+
+def routing_role(user_role: str) -> str:
+    return "customer" if user_role == "customer" else "staff"
+
+
+def allowed_choices(db: Session, role: str) -> list[dict]:
+    """Modèles que l'administrateur a affectés à ce rôle, toutes tâches actives confondues."""
+    config = get_routing_config(db)
+    if not config["enabled"]:
+        return []
+    seen: set[tuple[str, str]] = set()
+    choices: list[dict] = []
+    for task in AI_TASKS:
+        route = config["routes"].get(task, {}).get(role)
+        if not route or not route["enabled"]:
+            continue
+        for choice in route["models"]:
+            key = (choice["provider"], choice["model"])
+            if key not in seen:
+                seen.add(key)
+                choices.append(dict(choice))
+    return choices
+
+
+def resolve_selection(db: Session, role: str, selection: ModelSelection) -> dict:
+    """Valide un choix utilisateur et retourne la préférence normalisée à enregistrer."""
+    for choice in allowed_choices(db, role):
+        if choice["provider"] == selection.provider and choice["model"] == selection.model:
+            think = selection.think if selection.think is not None else choice["think"]
+            return {
+                "provider": choice["provider"],
+                "model": choice["model"],
+                "think": bool(think) if choice["provider"] == "ollama" else False,
+            }
+    raise ValueError("Ce modèle n’est pas proposé pour votre profil.")
+
+
+def apply_preference(choices: list[dict], allowed: list[dict], preference: dict | None) -> list[dict]:
+    """Place le modèle préféré en tête de la priorité, les autres restant en secours.
+
+    Le délai maximal reste celui défini par l'administrateur; un modèle qui n'est plus
+    autorisé est ignoré et la priorité par défaut s'applique.
+    """
+    if not preference:
+        return choices
+    for choice in allowed:
+        if choice["provider"] == preference.get("provider") and choice["model"] == preference.get("model"):
+            chosen = dict(choice)
+            if chosen["provider"] == "ollama" and preference.get("think") is not None:
+                chosen["think"] = bool(preference["think"])
+            rest = [
+                item for item in choices
+                if (item["provider"], item["model"]) != (chosen["provider"], chosen["model"])
+            ]
+            return [chosen, *rest]
+    return choices
+
+
+def user_ai_options(db: Session, user_role: str) -> dict:
+    role = routing_role(user_role)
+    choices = allowed_choices(db, role)
+    config = get_routing_config(db)
+    default_route = config["routes"].get(ROLE_DEFAULT_TASK[role], {}).get(role)
+    default = None
+    if config["enabled"] and default_route and default_route["enabled"] and default_route["models"]:
+        default = default_route["models"][0]
+    elif choices:
+        default = choices[0]
+    return {
+        "enabled": bool(choices),
+        "models": [
+            {
+                "provider": choice["provider"],
+                "model": choice["model"],
+                "supports_think": choice["provider"] == "ollama",
+                "think": choice["think"],
+            }
+            for choice in choices
+        ],
+        "default": {"provider": default["provider"], "model": default["model"], "think": default["think"]}
+        if default else None,
+    }
+
+
+def routing_for(task: str, role: str) -> tuple[bool, list[dict]]:
     from app.database import SessionLocal
 
     with SessionLocal() as db:
@@ -142,6 +305,9 @@ def provider_catalog() -> list[dict]:
             "configured": bool(settings.ollama_base_url),
             "status": "healthy" if ollama_models else ("warning" if not ollama_error else "down"),
             "default_model": settings.ollama_model,
+            "default_think": settings.ollama_think,
+            "default_timeout_seconds": _default_model_choice()["timeout_seconds"]
+            if settings.ai_provider.lower() != "anthropic" else DEFAULT_TIMEOUT_SECONDS,
             "available_models": ollama_models,
             "error": ollama_error,
         },
@@ -151,6 +317,8 @@ def provider_catalog() -> list[dict]:
             "configured": anthropic_configured,
             "status": "configured" if anthropic_configured else "unconfigured",
             "default_model": settings.anthropic_model,
+            "default_think": False,
+            "default_timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
             "available_models": [settings.anthropic_model] if anthropic_configured else [],
             "error": "" if anthropic_configured else "La clé ANTHROPIC_API_KEY n’est pas configurée.",
         },

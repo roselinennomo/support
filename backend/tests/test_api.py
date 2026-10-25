@@ -6,7 +6,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import _ensure_ai_consent_columns, _ensure_ticket_lifecycle_columns, _ensure_user_workflow_columns, app
-from app.models import Company, SLAPolicy, User
+from app.models import Company, SLAPolicy, Ticket, User
 from app.security import create_access_token, hash_password, verify_password
 
 
@@ -447,30 +447,19 @@ def test_customer_access_requires_company_code_and_agent_approval(client, monkey
         f"/api/tickets/{ticket['id']}/status",
         headers=agent_headers,
         json={"status": "escalated"},
-    ).status_code == 409
-    escalation = api.post(
+    ).status_code == 422  # l'escalade manuelle n'existe plus : seule l'IA transmet au support
+    assert api.post(
         f"/api/tickets/{ticket['id']}/escalate",
         headers=agent_headers,
-        json={
-            "team": "Expertise OXE",
-            "reason": "Analyse approfondie demandée.",
-            "external_reference": "EXP-123",
-        },
-    )
-    assert escalation.status_code == 200
-    assert escalation.json()["escalation_team"] == "Expertise OXE"
+        json={"team": "Expertise OXE", "reason": "Analyse approfondie demandée."},
+    ).status_code in {404, 405}
     support_reply = api.post(
         f"/api/tickets/{ticket['id']}/messages",
         headers=agent_headers,
         json={"body": "Nous analysons votre configuration.", "visibility": "public"},
     )
     assert support_reply.status_code == 200
-    assert support_reply.json()["status"] == "escalated"
-    assert api.post(
-        f"/api/tickets/{ticket['id']}/messages",
-        headers=agent_headers,
-        json={"body": "Note interne de suivi.", "visibility": "internal"},
-    ).json()["status"] == "escalated"
+    assert support_reply.json()["status"] == "in_progress"
     waiting_customer = api.patch(
         f"/api/tickets/{ticket['id']}/status",
         headers=agent_headers,
@@ -656,8 +645,13 @@ def test_customer_access_requires_company_code_and_agent_approval(client, monkey
         "password": "un-autre-mot-de-passe",
     })
     second_headers = auth_headers(second_login.json()["access_token"])
-    assert api.get("/api/tickets", headers=second_headers).json() == []
-    assert api.get(f"/api/tickets/{ticket['id']}", headers=second_headers).status_code == 404
+    # Les collègues d'une même entreprise partagent la visibilité des tickets.
+    colleague_ids = {item["id"] for item in api.get("/api/tickets", headers=second_headers).json()}
+    assert {ticket["id"], ai_resolved.json()["id"]} <= colleague_ids
+    colleague_view = api.get(f"/api/tickets/{ticket['id']}", headers=second_headers)
+    assert colleague_view.status_code == 200
+    assert colleague_view.json()["customer_name"] != "Client Deux"
+    assert all(message["visibility"] == "public" for message in colleague_view.json()["messages"])
 
     rejected = api.post("/api/auth/register", json={
         "email": "client-refuse@example.com",
@@ -847,7 +841,8 @@ def test_existing_database_gets_ticket_lifecycle_columns(monkeypatch):
 def test_rag_admin_routes_require_admin_and_manage_corpus(client, monkeypatch, tmp_path):
     api, testing_session = client
     monkeypatch.setattr("app.main.settings.rag_documents_dir", str(tmp_path))
-    monkeypatch.setattr("app.main.settings.max_attachment_size", 5)
+    monkeypatch.setattr("app.main.settings.rag_max_file_size", 5)
+    monkeypatch.setattr("app.main.settings.rag_max_files_per_upload", 5)
     monkeypatch.setattr("app.main.inspect_index", lambda: {
         "collection": "support_documents",
         "embedding_model": "nomic-embed-text",
@@ -1031,10 +1026,31 @@ def test_ai_routing_is_admin_only_persistent_and_requires_active_model(client, m
     payload = {"enabled": False, "routes": routes}
     saved = api.put("/api/admin/ai-routing", headers=admin_headers, json=payload)
     assert saved.status_code == 200
-    assert saved.json() == payload
+    # Les options think/timeout absentes de la requête reçoivent leurs valeurs par défaut.
+    assert saved.json()["routes"]["agent_assistance"]["staff"]["models"] == [
+        {"provider": "ollama", "model": "qwen3:8b", "think": False, "timeout_seconds": 120}
+    ]
     reread = api.get("/api/admin/ai-routing", headers=admin_headers).json()
     assert reread["enabled"] is False
     assert reread["routes"]["agent_assistance"]["staff"]["models"][0]["model"] == "qwen3:8b"
+
+    tuned_routes = {task: {role: dict(route) for role, route in role_routes.items()}
+                    for task, role_routes in routes.items()}
+    tuned_routes["agent_assistance"]["staff"] = {
+        "enabled": True,
+        "models": [
+            {"provider": "ollama", "model": "deepseek-r1:1.5b", "think": True, "timeout_seconds": 600},
+        ],
+    }
+    tuned = api.put("/api/admin/ai-routing", headers=admin_headers, json={"enabled": True, "routes": tuned_routes})
+    assert tuned.status_code == 200
+    assert tuned.json()["routes"]["agent_assistance"]["staff"]["models"][0] == {
+        "provider": "ollama", "model": "deepseek-r1:1.5b", "think": True, "timeout_seconds": 600,
+    }
+    tuned_routes["agent_assistance"]["staff"]["models"][0]["timeout_seconds"] = 5
+    assert api.put(
+        "/api/admin/ai-routing", headers=admin_headers, json={"enabled": True, "routes": tuned_routes},
+    ).status_code == 422
 
     invalid = {
         "enabled": True,
@@ -1060,3 +1076,527 @@ def test_ai_routing_is_admin_only_persistent_and_requires_active_model(client, m
         json={"enabled": True, "routes": anthropic_routes},
     )
     assert anthropic.status_code == 422
+
+
+def test_customers_share_tickets_within_their_company_only(client, monkeypatch):
+    api, testing_session = client
+    monkeypatch.setattr("app.tickets._run_customer_ai", lambda _ticket_id: None)
+    with testing_session() as db:
+        admin = User(email="share-admin@example.com", full_name="Admin", password_hash=hash_password("x" * 12), role="admin")
+        db.add(admin)
+        db.flush()
+        company = Company(name="Entreprise A", invitation_code_hash="hash-share-a", created_by_id=admin.id)
+        other_company = Company(name="Entreprise B", invitation_code_hash="hash-share-b", created_by_id=admin.id)
+        db.add_all([company, other_company])
+        db.flush()
+        author = User(email="author@example.com", full_name="Auteur", password_hash=hash_password("x" * 12), role="customer", company_id=company.id)
+        colleague = User(email="colleague@example.com", full_name="Collègue", password_hash=hash_password("x" * 12), role="customer", company_id=company.id)
+        outsider = User(email="intruder@example.com", full_name="Intrus", password_hash=hash_password("x" * 12), role="customer", company_id=other_company.id)
+        db.add_all([author, colleague, outsider])
+        db.commit()
+        author_headers, colleague_headers, outsider_headers = (
+            user_headers(author), user_headers(colleague), user_headers(outsider),
+        )
+
+    created = api.post("/api/tickets", headers=author_headers, json={
+        "title": "Postes IP hors service",
+        "description": "Plusieurs postes IP Touch perdent leur enregistrement.",
+        "product": "OXE",
+    })
+    assert created.status_code == 201
+    ticket_id = created.json()["id"]
+
+    assert [item["id"] for item in api.get("/api/tickets", headers=colleague_headers).json()] == [ticket_id]
+    shared = api.get(f"/api/tickets/{ticket_id}", headers=colleague_headers)
+    assert shared.status_code == 200
+    assert shared.json()["customer_name"] == "Auteur"
+
+    # Après transfert à l'équipe support, le collègue peut répondre comme l'auteur.
+    with testing_session() as db:
+        db.get(Ticket, ticket_id).status = "new"
+        db.commit()
+    reply = api.post(f"/api/tickets/{ticket_id}/messages", headers=colleague_headers, json={"body": "Même problème chez moi."})
+    assert reply.status_code == 200
+    assert any(message["author_name"] == "Collègue" for message in reply.json()["messages"])
+    assert api.post(
+        f"/api/tickets/{ticket_id}/messages", headers=colleague_headers,
+        json={"body": "Note interne", "visibility": "internal"},
+    ).status_code == 403
+    assert api.post(
+        f"/api/tickets/{ticket_id}/messages", headers=outsider_headers, json={"body": "Intrusion"},
+    ).status_code == 404
+
+    assert api.get("/api/tickets", headers=outsider_headers).json() == []
+    assert api.get(f"/api/tickets/{ticket_id}", headers=outsider_headers).status_code == 404
+
+
+def _routing_payload(customer_models, staff_models):
+    return {
+        "enabled": True,
+        "routes": {
+            task: {
+                "customer": {"enabled": True, "models": customer_models},
+                "staff": {"enabled": True, "models": staff_models},
+            }
+            for task in ("customer_diagnosis", "agent_assistance", "handoff_summary", "ticket_analysis")
+        },
+    }
+
+
+def test_users_choose_models_among_those_assigned_by_admin(client, monkeypatch):
+    api, testing_session = client
+    monkeypatch.setattr("app.tickets._run_customer_ai", lambda _ticket_id: None)
+    agent_calls = []
+    monkeypatch.setattr("app.tickets._run_agent_ai", lambda *args: agent_calls.append(args))
+    with testing_session() as db:
+        admin = User(email="pick-admin@example.com", full_name="Admin", password_hash=hash_password("x" * 12), role="admin")
+        db.add(admin)
+        db.flush()
+        company = Company(name="Entreprise choix", invitation_code_hash="hash-pick", created_by_id=admin.id)
+        db.add(company)
+        db.flush()
+        customer = User(email="pick-customer@example.com", full_name="Client", password_hash=hash_password("x" * 12), role="customer", company_id=company.id)
+        colleague = User(email="pick-colleague@example.com", full_name="Collègue", password_hash=hash_password("x" * 12), role="customer", company_id=company.id)
+        agent = User(email="pick-agent@example.com", full_name="Agent", password_hash=hash_password("x" * 12), role="agent")
+        db.add_all([customer, colleague, agent])
+        db.flush()
+        company.agents = [agent]
+        db.commit()
+        admin_h, customer_h, colleague_h, agent_h = (user_headers(user) for user in (admin, customer, colleague, agent))
+
+    # Sans configuration enregistrée : modèle par défaut deepseek-r1:1.5b avec think activé.
+    options = api.get("/api/ai/options", headers=customer_h).json()
+    assert options["default"] == {"provider": "ollama", "model": "deepseek-r1:1.5b", "think": True}
+    # qwen3:4b (OLLAMA_EXTRA_MODELS) est proposé dès la configuration initiale, sans raisonnement.
+    assert [(item["model"], item["think"]) for item in options["models"]] == [
+        ("deepseek-r1:1.5b", True), ("qwen3:4b", False),
+    ]
+    assert api.get("/api/ai/options").status_code == 401
+
+    qwen = {"provider": "ollama", "model": "qwen3:4b", "think": False, "timeout_seconds": 200}
+    deepseek = {"provider": "ollama", "model": "deepseek-r1:1.5b", "think": True, "timeout_seconds": 300}
+    saved = api.put("/api/admin/ai-routing", headers=admin_h, json=_routing_payload([deepseek, qwen], [qwen]))
+    assert saved.status_code == 200
+
+    customer_options = api.get("/api/ai/options", headers=customer_h).json()
+    assert [item["model"] for item in customer_options["models"]] == ["deepseek-r1:1.5b", "qwen3:4b"]
+    assert customer_options["default"]["model"] == "deepseek-r1:1.5b"
+    assert [item["model"] for item in api.get("/api/ai/options", headers=agent_h).json()["models"]] == ["qwen3:4b"]
+
+    # Le client choisit un modèle autorisé et le raisonnement à la création du ticket.
+    created = api.post("/api/tickets", headers=customer_h, json={
+        "title": "Postes IP hors service",
+        "description": "Plusieurs postes IP Touch perdent leur enregistrement.",
+        "product": "OXE",
+        "ai_model": {"provider": "ollama", "model": "qwen3:4b", "think": True},
+    })
+    assert created.status_code == 201
+    assert created.json()["ai_preferences"] == {"provider": "ollama", "model": "qwen3:4b", "think": True}
+    ticket_id = created.json()["id"]
+
+    refused = api.post("/api/tickets", headers=customer_h, json={
+        "title": "Postes IP hors service",
+        "description": "Plusieurs postes IP Touch perdent leur enregistrement.",
+        "product": "OXE",
+        "ai_model": {"provider": "ollama", "model": "llama3:70b"},
+    })
+    assert refused.status_code == 422
+
+    # Un collègue de l'entreprise peut modifier le choix; sans `think`, la valeur de l'admin s'applique.
+    changed = api.put(f"/api/tickets/{ticket_id}/ai-preferences", headers=colleague_h, json={
+        "provider": "ollama", "model": "deepseek-r1:1.5b",
+    })
+    assert changed.status_code == 200
+    assert changed.json()["ai_preferences"] == {"provider": "ollama", "model": "deepseek-r1:1.5b", "think": True}
+    assert api.put(
+        f"/api/tickets/{ticket_id}/ai-preferences", headers=customer_h,
+        json={"provider": "anthropic", "model": "claude-custom"},
+    ).status_code == 422
+    assert api.put(
+        f"/api/tickets/{ticket_id}/ai-preferences", headers=agent_h,
+        json={"provider": "ollama", "model": "qwen3:4b"},
+    ).status_code == 403
+
+    # L'agent choisit son modèle pour le résumé du ticket, parmi ceux de l'équipe support.
+    with testing_session() as db:
+        db.get(Ticket, ticket_id).status = "new"
+        db.commit()
+    summary = api.post(f"/api/tickets/{ticket_id}/ai-assist", headers=agent_h, json={
+        "kind": "summary", "ai_model": {"provider": "ollama", "model": "qwen3:4b", "think": False},
+    })
+    assert summary.status_code == 202
+    _ticket, _question, _actor, preference, is_summary = agent_calls[-1]
+    assert preference == {"provider": "ollama", "model": "qwen3:4b", "think": False}
+    assert is_summary is True
+    assert api.post(f"/api/tickets/{ticket_id}/ai-assist", headers=agent_h, json={"question": "ok"}).status_code == 422
+    assert api.post(
+        f"/api/tickets/{ticket_id}/ai-assist", headers=agent_h,
+        json={"question": "Que vérifier ensuite ?", "ai_model": {"provider": "ollama", "model": "deepseek-r1:1.5b"}},
+    ).status_code == 422  # deepseek n'est pas affecté à l'équipe support
+
+    reset = api.delete("/api/admin/ai-routing", headers=admin_h)
+    assert reset.status_code == 200
+    assert reset.json()["routes"]["customer_diagnosis"]["customer"]["models"][0]["model"] == "deepseek-r1:1.5b"
+    assert api.delete("/api/admin/ai-routing", headers=customer_h).status_code == 403
+
+
+def _rag_admin_and_agent(testing_session, suffix):
+    with testing_session() as db:
+        admin = User(email=f"rag-{suffix}-admin@example.com", full_name="Admin", password_hash=hash_password("x" * 12), role="admin")
+        agent = User(email=f"rag-{suffix}-agent@example.com", full_name="Agent", password_hash=hash_password("x" * 12), role="agent")
+        db.add_all([admin, agent])
+        db.commit()
+        return user_headers(admin), user_headers(agent)
+
+
+def test_admin_switches_embedding_model_and_reindexes(client, monkeypatch):
+    from app import main, rag
+
+    api, testing_session = client
+    admin_h, agent_h = _rag_admin_and_agent(testing_session, "embed")
+    ran = []
+    monkeypatch.setattr(main, "_run_rag_indexing", lambda: ran.append(True))
+    monkeypatch.setattr(main, "installed_ollama_models", lambda: {"qwen3-embedding:0.6b", "qwen3-embedding:4b"})
+    main._rag_index_job["status"] = "idle"
+    try:
+        assert api.put("/api/admin/rag/embedding-model", headers=agent_h, json={"model": "bge-m3"}).status_code == 403
+        assert api.put("/api/admin/rag/embedding-model", headers=admin_h, json={"model": "nomic-embed-text"}).status_code == 422
+        unchanged = api.put("/api/admin/rag/embedding-model", headers=admin_h, json={"model": "qwen3-embedding:0.6b"})
+        assert unchanged.json()["indexing"] == "unchanged"
+
+        # bge-m3 n'est pas installé; qwen3-embedding:4b l'est mais ne doit pas valider le :0.6b.
+        missing = api.put("/api/admin/rag/embedding-model", headers=admin_h, json={"model": "bge-m3"})
+        assert missing.status_code == 409
+        assert "ollama-embed" in missing.json()["detail"]
+        assert rag.embedding_model() == "qwen3-embedding:0.6b"
+
+        switched = api.put("/api/admin/rag/embedding-model", headers=admin_h, json={"model": "qwen3-embedding:4b"})
+        assert switched.status_code == 202
+        assert switched.json() == {"embedding_model": "qwen3-embedding:4b", "indexing": "pending"}
+        assert ran == [True]
+        assert rag.embedding_model() == "qwen3-embedding:4b"
+        assert rag.embedding_dimension() == 2560
+        assert rag.collection_name().endswith("qwen3-embedding-4b")
+
+        # Pas de second changement pendant la réindexation.
+        assert api.put(
+            "/api/admin/rag/embedding-model", headers=admin_h, json={"model": "qwen3-embedding:0.6b"},
+        ).status_code == 409
+    finally:
+        rag.set_embedding_model(None)
+        main._rag_index_job["status"] = "idle"
+
+
+def test_admin_deletes_documents_from_corpus_and_index(client, monkeypatch, tmp_path):
+    from app import main, rag
+
+    api, testing_session = client
+    admin_h, agent_h = _rag_admin_and_agent(testing_session, "delete")
+    monkeypatch.setattr(main.settings, "rag_documents_dir", str(tmp_path))
+    (tmp_path / "guide.md").write_text("guide", encoding="utf-8")
+    (tmp_path / "old.txt").write_text("old", encoding="utf-8")
+    (tmp_path / "keep.txt").write_text("keep", encoding="utf-8")
+    (tmp_path.parent / "outside.txt").write_text("outside", encoding="utf-8")
+    removed = []
+    monkeypatch.setattr(main, "delete_sources", lambda sources: removed.extend(sources))
+    main._rag_index_job["status"] = "idle"
+
+    assert api.request("DELETE", "/api/admin/rag/documents", headers=agent_h, json={"names": ["guide.md"]}).status_code == 403
+    assert api.request("DELETE", "/api/admin/rag/documents", headers=admin_h, json={"names": []}).status_code == 422
+    # Aucun fichier n'est supprimé si l'un des noms est invalide ou sort du corpus.
+    for bad in ("absent.txt", "../outside.txt"):
+        refused = api.request("DELETE", "/api/admin/rag/documents", headers=admin_h, json={"names": ["guide.md", bad]})
+        assert refused.status_code == 404
+    assert (tmp_path / "guide.md").exists() and (tmp_path.parent / "outside.txt").exists()
+
+    main._rag_index_job["status"] = "running"
+    assert api.request("DELETE", "/api/admin/rag/documents", headers=admin_h, json={"names": ["guide.md"]}).status_code == 409
+    main._rag_index_job["status"] = "idle"
+
+    deleted = api.request("DELETE", "/api/admin/rag/documents", headers=admin_h, json={"names": ["guide.md", "old.txt"]})
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": ["guide.md", "old.txt"], "index_updated": True}
+    assert removed == ["guide.md", "old.txt"]
+    assert not (tmp_path / "guide.md").exists() and not (tmp_path / "old.txt").exists()
+    assert (tmp_path / "keep.txt").exists()
+
+    # Qdrant indisponible : les fichiers sont supprimés, la prochaine synchronisation nettoiera l'index.
+    monkeypatch.setattr(main, "delete_sources", lambda _sources: (_ for _ in ()).throw(rag.RAGError("qdrant down")))
+    degraded = api.request("DELETE", "/api/admin/rag/documents", headers=admin_h, json={"names": ["keep.txt"]})
+    assert degraded.status_code == 200
+    assert degraded.json() == {"deleted": ["keep.txt"], "index_updated": False}
+    assert not (tmp_path / "keep.txt").exists()
+
+
+def test_supervision_diagnostics_and_pricing_expose_generation_and_embedding_separately(client, monkeypatch):
+    from app import ai_observability, main
+
+    api, testing_session = client
+    admin_h, _agent_h = _rag_admin_and_agent(testing_session, "visibility")
+    embedding = {
+        "status": "warning",
+        "error": "",
+        "base_url": "http://ollama-embed:11434",
+        "dedicated_instance": True,
+        "model": "qwen3-embedding:0.6b",
+        "dimension": 1024,
+        "collection": "support_documents_qwen3-embedding-0-6b",
+        "installed_models": ["bge-m3"],
+        "options": [{"id": "bge-m3", "label": "BGE-M3", "dimension": 1024, "installed": True, "selected": False, "selectable": True}],
+    }
+    qdrant = {"status": "healthy", "error": "", "collection": embedding["collection"], "collection_exists": False}
+    for module in (main, ai_observability):
+        monkeypatch.setattr(module, "embedding_status", lambda: embedding)
+        monkeypatch.setattr(module, "qdrant_status", lambda: qdrant)
+    monkeypatch.setattr(ai_observability, "provider_catalog", lambda: [
+        {"id": "ollama", "available_models": ["deepseek-r1:1.5b", "qwen3:4b"]},
+        {"id": "anthropic", "available_models": []},
+    ])
+
+    services = {item["name"]: item for item in api.get("/api/system/overview", headers=admin_h).json()["services"]}
+    assert {"ollama", "embedding", "rag"} <= set(services)
+    assert services["embedding"]["status"] == "warning"
+    assert "qwen3-embedding:0.6b" in services["embedding"]["detail"]
+    assert "embedding" not in services["ollama"]["detail"].lower()
+    assert services["rag"]["status"] == "healthy"
+    assert "support_documents_qwen3-embedding-0-6b" in services["rag"]["detail"]
+
+    diagnostics = api.get("/api/admin/ai/diagnostics", headers=admin_h).json()
+    assert diagnostics["embedding"]["model"] == "qwen3-embedding:0.6b"
+    assert diagnostics["embedding"]["dedicated_instance"] is True
+    assert diagnostics["rag"]["collection_exists"] is False
+
+    pricing = api.get("/api/admin/ai/pricing", headers=admin_h).json()
+    assert pricing["available_models"]["ollama"] == ["deepseek-r1:1.5b", "qwen3:4b"]
+
+
+class _KBScraperDouble:
+    def __init__(self, healthy=True, state="valid"):
+        self.healthy, self.state = healthy, state
+
+    def health(self):
+        return self.healthy
+
+    def session_state(self):
+        from app.kb.interfaces import SessionState
+
+        return SessionState(self.state)
+
+    def logs(self, limit=100):
+        return [{"ts": "2026-01-01T00:00:00Z", "level": "warning", "event": "selector_failed", "selector": "input.q"}]
+
+
+def _kb_users(testing_session):
+    with testing_session() as db:
+        admin = User(email="kb-admin@example.com", full_name="Admin", password_hash=hash_password("x" * 12), role="admin")
+        agent = User(email="kb-agent@example.com", full_name="Agent", password_hash=hash_password("x" * 12), role="agent")
+        db.add_all([admin, agent])
+        db.flush()
+        company = Company(name="Entreprise KB", invitation_code_hash="hash-kb", created_by_id=admin.id)
+        db.add(company)
+        db.flush()
+        customer = User(email="kb-customer@example.com", full_name="Client", password_hash=hash_password("x" * 12), role="customer", company_id=company.id)
+        db.add(customer)
+        db.flush()
+        company.agents = [agent]
+        db.commit()
+        return user_headers(admin), user_headers(agent), user_headers(customer)
+
+
+def test_kb_admin_console_is_admin_only_and_inert_when_disabled_by_the_server(client, monkeypatch):
+    api, testing_session = client
+    admin_h, agent_h, _customer_h = _kb_users(testing_session)
+    monkeypatch.setattr("app.kb.flags.settings.enable_kb_browser_scraper", False)
+    monkeypatch.setattr("app.kb.router.get_scraper", lambda: (_ for _ in ()).throw(AssertionError("no browser call")))
+
+    assert api.get("/api/admin/kb", headers=agent_h).status_code == 403
+    assert api.get("/api/admin/kb").status_code == 401
+    status = api.get("/api/admin/kb", headers=admin_h).json()
+    assert (status["env_enabled"], status["effective"], status["browser_online"]) == (False, False, False)
+    assert status["metrics"]["searches"] == 0 and status["recent_jobs"] == []
+    assert api.put("/api/admin/kb/settings", headers=admin_h, json={"enabled": True}).status_code == 409
+    assert api.post("/api/admin/kb/session/check", headers=admin_h).status_code == 409
+    assert api.post("/api/admin/kb/reindex", headers=admin_h).status_code == 409
+    services = {item["name"] for item in api.get("/api/system/overview", headers=admin_h).json()["services"]}
+    assert "kb" not in services
+
+
+def test_kb_admin_console_toggle_session_and_debug(client, monkeypatch):
+    api, testing_session = client
+    admin_h, _agent_h, _customer_h = _kb_users(testing_session)
+    scraper = _KBScraperDouble()
+    monkeypatch.setattr("app.kb.flags.settings.enable_kb_browser_scraper", True)
+    monkeypatch.setattr("app.kb.router.get_scraper", lambda: scraper)
+
+    status = api.get("/api/admin/kb", headers=admin_h).json()
+    assert (status["env_enabled"], status["enabled"], status["effective"], status["browser_online"]) == (True, True, True, True)
+
+    toggled = api.put("/api/admin/kb/settings", headers=admin_h, json={"enabled": False})
+    assert toggled.json() == {"enabled": False, "effective": False}
+    assert api.get("/api/admin/kb", headers=admin_h).json()["effective"] is False
+    kb_service = next(item for item in api.get("/api/system/overview", headers=admin_h).json()["services"] if item["name"] == "kb")
+    assert kb_service["status"] == "disabled"
+    api.put("/api/admin/kb/settings", headers=admin_h, json={"enabled": True})
+
+    scraper.state = "expired"
+    checked = api.post("/api/admin/kb/session/check", headers=admin_h).json()
+    assert checked["state"] == "expired" and "expirée" in checked["last_alert"]
+    kb_service = next(item for item in api.get("/api/system/overview", headers=admin_h).json()["services"] if item["name"] == "kb")
+    assert kb_service["status"] == "warning" and "expirée" in kb_service["detail"]
+
+    scraper.state = "valid"
+    assert api.post("/api/admin/kb/session/check", headers=admin_h).json()["last_alert"] == ""
+
+    scraper.healthy = False
+    assert api.get("/api/admin/kb", headers=admin_h).json()["browser_online"] is False
+    kb_service = next(item for item in api.get("/api/system/overview", headers=admin_h).json()["services"] if item["name"] == "kb")
+    assert kb_service["status"] == "warning" and "hors ligne" in kb_service["detail"]
+
+    debug = api.get("/api/admin/kb/debug", headers=admin_h).json()
+    assert debug["browser_logs"][0]["selector"] == "input.q" and debug["jobs"] == []
+
+
+def test_ticket_creation_schedules_kb_enrichment_in_background_without_blocking(client, monkeypatch):
+    api, testing_session = client
+    _admin_h, _agent_h, customer_h = _kb_users(testing_session)
+    monkeypatch.setattr("app.tickets._run_customer_ai", lambda _ticket_id: None)
+    scheduled = []
+    monkeypatch.setattr("app.tickets.enqueue_ticket_enrichment", lambda ticket_id: scheduled.append(ticket_id) or True)
+
+    created = api.post("/api/tickets", headers=customer_h, json={
+        "title": "Switch OS6860E perd le stacking",
+        "description": "Après redémarrage, le lien de stacking est coupé sur le switch.",
+        "product": "OmniSwitch",
+    })
+
+    assert created.status_code == 201
+    assert scheduled == [created.json()["id"]]
+
+
+def test_agent_can_request_kb_enrichment_only_when_enabled_and_consented(client, monkeypatch):
+    api, testing_session = client
+    _admin_h, agent_h, customer_h = _kb_users(testing_session)
+    monkeypatch.setattr("app.tickets._run_customer_ai", lambda _ticket_id: None)
+    ticket_id = api.post("/api/tickets", headers=customer_h, json={
+        "title": "Switch OS6860E perd le stacking",
+        "description": "Après redémarrage, le lien de stacking est coupé sur le switch.",
+    }).json()["id"]
+    with testing_session() as db:
+        db.get(Ticket, ticket_id).status = "new"
+        db.commit()
+    queued = []
+    monkeypatch.setattr("app.tickets.enqueue_ticket_enrichment", lambda ticket_id_: queued.append(ticket_id_) or True)
+
+    monkeypatch.setattr("app.tickets.kb_flags.is_enabled", lambda: False)
+    assert api.post(f"/api/tickets/{ticket_id}/kb-enrich", headers=agent_h).status_code == 409
+    assert api.post(f"/api/tickets/{ticket_id}/kb-enrich", headers=customer_h).status_code == 403
+
+    monkeypatch.setattr("app.tickets.kb_flags.is_enabled", lambda: True)
+    accepted = api.post(f"/api/tickets/{ticket_id}/kb-enrich", headers=agent_h)
+    assert accepted.status_code == 202 and accepted.json() == {"status": "queued"}
+    assert queued == [ticket_id]
+    options = api.get("/api/ai/options", headers=agent_h).json()
+    assert options["kb_enabled"] is True
+    assert "kb_enabled" not in api.get("/api/ai/options", headers=customer_h).json()
+
+
+def test_tickets_left_thinking_by_a_restart_get_their_ai_diagnosis_relaunched(client, monkeypatch):
+    from app import tickets
+
+    api, testing_session = client
+    _admin_h, _agent_h, customer_h = _kb_users(testing_session)
+    monkeypatch.setattr("app.tickets._run_customer_ai", lambda _ticket_id: None)
+    pending = api.post("/api/tickets", headers=customer_h, json={
+        "title": "Postes IP hors service",
+        "description": "Plusieurs postes IP Touch perdent leur enregistrement.",
+    }).json()["id"]
+    done = api.post("/api/tickets", headers=customer_h, json={
+        "title": "Autre incident réglé",
+        "description": "Un incident déjà traité par l'assistant sans problème.",
+    }).json()["id"]
+    with testing_session() as db:
+        db.get(Ticket, done).ai_status = "complete"
+        db.commit()
+    relaunched = []
+    monkeypatch.setattr(tickets, "_run_customer_ai", relaunched.append)
+
+    assert tickets.recover_stuck_ai_tickets(testing_session, background=False) == 1
+    assert relaunched == [pending]
+
+
+
+def test_kb_jobs_and_tickets_are_paginated_on_the_server(client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from app.models import KBJob
+
+    api, testing_session = client
+    admin_h, _agent_h, customer_h = _kb_users(testing_session)
+    monkeypatch.setattr("app.kb.flags.settings.enable_kb_browser_scraper", False)
+    monkeypatch.setattr("app.tickets._run_customer_ai", lambda _ticket_id: None)
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with testing_session() as db:
+        for index in range(7):
+            db.add(KBJob(
+                status="failed" if index % 3 == 0 else "success", query=f"requête {index}",
+                created_at=base + timedelta(minutes=index),
+            ))
+        db.commit()
+
+    first = api.get("/api/admin/kb?jobs_limit=3", headers=admin_h).json()
+    assert [job["query"] for job in first["recent_jobs"]] == ["requête 6", "requête 5", "requête 4"]  # plus récent d'abord
+    assert first["jobs_total"] == 7
+    assert first["job_counts"] == {"all": 7, "success": 4, "failed": 3, "skipped": 0, "running": 0}
+
+    last = api.get("/api/admin/kb?jobs_limit=3&jobs_offset=6", headers=admin_h).json()
+    assert [job["query"] for job in last["recent_jobs"]] == ["requête 0"]
+
+    failed = api.get("/api/admin/kb?jobs_limit=2&jobs_status=failed", headers=admin_h).json()
+    assert failed["jobs_total"] == 3 and [job["query"] for job in failed["recent_jobs"]] == ["requête 6", "requête 3"]
+    assert api.get("/api/admin/kb?jobs_status=nimporte", headers=admin_h).status_code == 422
+    assert api.get("/api/admin/kb?jobs_limit=1000", headers=admin_h).status_code == 422
+
+    debug = api.get("/api/admin/kb/debug?limit=2&offset=2", headers=admin_h).json()
+    assert debug["jobs_total"] == 7 and [job["query"] for job in debug["jobs"]] == ["requête 4", "requête 3"]
+
+    for number in range(3):
+        assert api.post("/api/tickets", headers=customer_h, json={
+            "title": f"Incident numéro {number}", "description": "Description suffisamment longue pour être valide.",
+        }).status_code == 201
+    assert len(api.get("/api/tickets", headers=customer_h).json()) == 3
+    assert len(api.get("/api/tickets?limit=2", headers=customer_h).json()) == 2
+    assert api.get("/api/tickets?limit=0", headers=customer_h).status_code == 422
+
+
+
+def test_admin_can_inspect_export_and_restore_the_local_kb_archive(client, monkeypatch, tmp_path):
+    from app.kb.archive import KBArchive
+    from app.models import KBArticle
+
+    api, testing_session = client
+    admin_h, agent_h, _customer_h = _kb_users(testing_session)
+    archive = KBArchive(tmp_path / "kb_archive", 10 * 1024 * 1024)
+    monkeypatch.setattr("app.kb.router.get_archive", lambda: archive)
+    queued = []
+    monkeypatch.setattr("app.kb.router.enqueue_reindex", lambda: queued.append(True) or True)
+
+    assert api.get("/api/admin/kb/archive", headers=agent_h).status_code == 403
+    assert api.get("/api/admin/kb/archive", headers=admin_h).json()["items"] == 0
+
+    with testing_session() as db:
+        db.add(KBArticle(url="https://kb.example/a", title="Article A", content="Texte A", content_hash="ha", source="kb"))
+        db.commit()
+    exported = api.post("/api/admin/kb/archive/export", headers=admin_h).json()
+    assert exported["exported"] == 1 and exported["items"] == 1
+    assert api.post("/api/admin/kb/archive/export", headers=admin_h).json()["exported"] == 0  # pas de répétition
+
+    with testing_session() as db:
+        db.query(KBArticle).delete()
+        db.commit()
+    restored = api.post("/api/admin/kb/archive/restore", headers=admin_h).json()
+    assert restored["restored"] == 1 and restored["reindex_queued"] is True and queued == [True]
+    assert api.post("/api/admin/kb/archive/restore", headers=admin_h).json()["restored"] == 0
+
+    monkeypatch.setattr("app.kb.router.get_archive", lambda: None)
+    assert api.get("/api/admin/kb/archive", headers=admin_h).json() == {"enabled": False}
+    assert api.post("/api/admin/kb/archive/export", headers=admin_h).status_code == 409

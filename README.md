@@ -12,7 +12,7 @@ Portail de support technique pour les incidents Alcatel-Lucent OXE et produits a
    ```
 
 3. Ouvrir <http://localhost:8080>. L'interface est servie par Nginx et l'API est accessible sous `/api`.
-4. Se connecter avec l'administrateur défini dans `.env`. Ollama est configuré par défaut avec `qwen3:4b`; le premier démarrage télécharge ce modèle en arrière-plan, ce qui peut prendre du temps et plusieurs gigaoctets. L'interface et l'API démarrent sans attendre la fin du téléchargement.
+4. Se connecter avec l'administrateur défini dans `.env`. Ollama est configuré par défaut avec `deepseek-r1:1.5b` et le raisonnement (`think`) activé; `qwen3:4b` est aussi téléchargé. L'administrateur règle les modèles, le raisonnement et le délai de chaque règle dans **Configuration IA**; les clients (diagnostic) et les agents (aide IA, résumé du ticket) choisissent ensuite parmi les modèles qu'il a affectés. Le premier démarrage télécharge ces modèles en arrière-plan, ce qui peut prendre du temps et plusieurs gigaoctets. L'interface et l'API démarrent sans attendre la fin du téléchargement.
 
 Pour arrêter les services : `docker compose down`. Pour supprimer aussi les données locales : `docker compose down -v` (suppression irréversible des tickets et comptes de la base).
 
@@ -32,6 +32,10 @@ Pour arrêter les services : `docker compose down`. Pour supprimer aussi les don
 - Notes internes, changements de statut, attribution à un agent et historique d'audit.
 - Rôles `customer`, `agent` et `admin`; les agents sont limités aux entreprises auxquelles ils sont affectés, et la création d'agents est réservée à l'administrateur.
 - Choix du fournisseur IA par configuration (`ollama` par défaut ou `anthropic`).
+- Clients indépendants (entreprise individuelle, facturation propre, console d'aide) : voir [docs/independent-clients.md](docs/independent-clients.md).
+- Console d'aide (administrateurs, agents et clients indépendants) : conversations libres ou sur un ticket, connaissances communes + documents d'une entreprise, recherche live du portail constructeur et recherche web optionnelles : voir [docs/help-console.md](docs/help-console.md).
+- Documents propres à chaque entreprise (privés, index séparé, déposés par l'entreprise ou un administrateur) : voir [docs/company-docs.md](docs/company-docs.md).
+- Enrichissement optionnel par la KB constructeur (avec archive locale `kb_archive/` des fichiers originaux, restaurée automatiquement) via un navigateur Playwright conteneurisé (désactivé par défaut) : voir [docs/kb-scraper.md](docs/kb-scraper.md).
 - RAG documentaire avec Qdrant, indexation incrémentale automatique des PDF, Markdown et fichiers texte dans `support_docs`, recherche de passages pertinents et références de sources dans les réponses IA.
 - Console d’administration de supervision des services : santé de la base, de l’API, d’Ollama et de la file de support.
 

@@ -2,19 +2,24 @@ import json
 import logging
 import time
 from contextvars import ContextVar
+from collections.abc import Callable
 from typing import TypedDict
 
 import httpx
 from langgraph.graph import END, START, StateGraph
 
-from app.ai_routing import routing_for
+from app.ai_routing import DEFAULT_TIMEOUT_SECONDS, ROLE_DEFAULT_TASK, allowed_choices, apply_preference, routing_for
 from app.config import settings
 from app.models import Ticket, TicketEvent
-from app.rag import retrieve_context
+from app.rag import reset_company_scope, retrieve_context, set_company_scope
 
 logger = logging.getLogger(__name__)
 _trace_context: ContextVar[dict | None] = ContextVar("ai_trace_context", default=None)
 _provider_usage: ContextVar[tuple[int, int]] = ContextVar("provider_usage", default=(0, 0))
+# Console d'aide : réponse en texte libre (pas de format JSON imposé) et raisonnement du modèle, s'il est exposé.
+_json_format: ContextVar[bool] = ContextVar("ollama_json_format", default=True)
+_provider_thinking: ContextVar[str] = ContextVar("provider_thinking", default="")
+_preference_context: ContextVar[dict | None] = ContextVar("ai_preference_context", default=None)
 
 
 class AnalysisState(TypedDict, total=False):
@@ -57,6 +62,64 @@ class AgentAssistState(TypedDict, total=False):
     model: str
 
 
+
+_PRIORITY_ALIASES = {
+    "low": "low", "basse": "low", "faible": "low", "p4": "low", "mineure": "low",
+    "medium": "medium", "moyenne": "medium", "normale": "medium", "modérée": "medium", "moderee": "medium", "p3": "medium",
+    "high": "high", "haute": "high", "élevée": "high", "elevee": "high", "importante": "high", "p2": "high",
+    "critical": "critical", "critique": "critical", "urgente": "critical", "bloquante": "critical", "p1": "critical",
+}
+_RECOMMENDATION_TEXT_KEYS = (
+    "action", "recommandation", "recommendation", "message", "text", "texte", "description", "titre", "title", "step", "étape",
+)
+
+
+_RECOMMENDATION_DETAIL_KEYS = ("reason", "raison", "justification", "explanation", "explication", "details", "détails")
+
+
+def _normalize_priority(value) -> str | None:
+    """Tolère la casse et les équivalents français (« Medium », « Haute »); None si inexploitable."""
+    return _PRIORITY_ALIASES.get(str(value).strip().lower()) if isinstance(value, str) else None
+
+
+def _normalize_recommendations(value) -> list[str] | None:
+    """Ramène à une liste de phrases les formes courantes des petits modèles (objets, texte à puces)."""
+    if isinstance(value, str):
+        value = [line.strip(" \t-•*") for line in value.splitlines()]
+    elif isinstance(value, dict):
+        value = list(value.values())
+    if not isinstance(value, list):
+        return None
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            primary = next((str(item[key]).strip() for key in _RECOMMENDATION_TEXT_KEYS if isinstance(item.get(key), str) and item[key].strip()), "")
+            detail = next((
+                str(item[key]).strip() for key in _RECOMMENDATION_DETAIL_KEYS
+                if isinstance(item.get(key), str) and item[key].strip()
+            ), "")
+            item = " — ".join(part for part in (primary or detail, detail if primary else "") if part)
+        elif not isinstance(item, str):
+            item = str(item) if isinstance(item, (int, float)) and not isinstance(item, bool) else ""
+        item = item.strip()
+        if item:
+            result.append(item)
+    return result
+
+
+def _flag(value) -> bool:
+    """Booléen d'indicateur secondaire : absent, nul ou illisible = False (jamais « résolu » par défaut)."""
+    value = _coerce_bool(value)
+    return value if isinstance(value, bool) else False
+
+
+def _coerce_bool(value):
+    """Accepte « true »/« false » en texte; renvoie la valeur inchangée sinon (validée ensuite)."""
+    if isinstance(value, str) and value.strip().lower() in {"true", "false", "vrai", "faux"}:
+        return value.strip().lower() in {"true", "vrai"}
+    return value
+
+
 class AIAnalysisError(Exception):
     pass
 
@@ -65,25 +128,44 @@ class AIRoutingDisabledError(AIAnalysisError):
     pass
 
 
-def _call_provider(prompt: str, task: str = "ticket_analysis", role: str = "staff") -> tuple[str, str, str]:
+def _call_provider(
+    prompt: str,
+    task: str = "ticket_analysis",
+    role: str = "staff",
+    validate: Callable[[str], object] | None = None,
+) -> tuple[str, str, str]:
+    """Appelle les modèles par ordre de priorité jusqu'à obtenir une réponse exploitable.
+
+    `validate(response)` lève ValueError si la réponse est inutilisable (JSON invalide, message absent) :
+    elle est alors traitée comme un échec du modèle et le suivant est essayé.
+    """
     enabled, choices = routing_for(task, role)
     if not enabled:
         raise AIRoutingDisabledError(
             f"L’assistance IA est désactivée pour la tâche « {task} » et le rôle « {role} »."
         )
+    preference = _preference_context.get()
+    if preference:
+        from app.database import SessionLocal
+
+        with SessionLocal() as db:
+            choices = apply_preference(choices, allowed_choices(db, role), preference)
     failures = []
     for choice in choices:
         provider = choice["provider"]
         model = choice["model"]
+        timeout = choice.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS
         usage_token = _provider_usage.set((0, 0))
         started_at = time.perf_counter()
         try:
             if provider == "ollama":
-                response = _call_ollama(prompt, model)
+                response = _call_ollama(prompt, model, think=bool(choice.get("think", False)), timeout=timeout)
             elif provider == "anthropic":
-                response = _call_anthropic(prompt, model)
+                response = _call_anthropic(prompt, model, timeout=timeout)
             else:
                 raise RuntimeError(f"Fournisseur IA non pris en charge : {provider}")
+            if validate is not None:
+                validate(response)
             input_tokens, output_tokens = _provider_usage.get()
             trace_context = _trace_context.get()
             if trace_context:
@@ -107,7 +189,7 @@ def _call_provider(prompt: str, task: str = "ticket_analysis", role: str = "staf
         except (httpx.HTTPError, RuntimeError, ValueError, KeyError, TypeError) as exc:
             failures.append(f"{provider}/{model}: {exc}")
             trace_context = _trace_context.get()
-            if trace_context:
+            if trace_context and trace_context.get("ticket_id"):  # pas d'événement de ticket pour la console d'aide
                 try:
                     from app.database import SessionLocal
 
@@ -151,17 +233,24 @@ Extraits documentaires récupérés:
 {context}"""
 
 
-def _call_ollama(prompt: str, model: str | None = None) -> str:
+def _call_ollama(
+    prompt: str,
+    model: str | None = None,
+    think: bool = False,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> str:
     response = httpx.post(
         f"{settings.ollama_base_url.rstrip('/')}/api/chat",
         json={
             "model": model or settings.ollama_model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "format": "json",
-            "options": {"temperature": 0.2},
+            "think": think,
+            **({"format": "json"} if _json_format.get() else {}),
+            "keep_alive": settings.ollama_keep_alive,
+            "options": {"temperature": 0.2, "num_ctx": settings.ollama_num_ctx},
         },
-        timeout=120,
+        timeout=timeout,
     )
     response.raise_for_status()
     payload = response.json()
@@ -169,10 +258,16 @@ def _call_ollama(prompt: str, model: str | None = None) -> str:
         int(payload.get("prompt_eval_count") or 0),
         int(payload.get("eval_count") or 0),
     ))
-    return payload["message"]["content"]
+    message = payload["message"]
+    content, thinking = message["content"], str(message.get("thinking") or "")
+    if "</think>" in content:  # certains modèles laissent le raisonnement dans le contenu
+        thinking = (thinking + "\n" + content.split("</think>", 1)[0].replace("<think>", "")).strip()
+        content = content.split("</think>", 1)[1]
+    _provider_thinking.set(thinking.strip())
+    return content
 
 
-def _call_anthropic(prompt: str, model: str | None = None) -> str:
+def _call_anthropic(prompt: str, model: str | None = None, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> str:
     if not settings.anthropic_api_key:
         raise RuntimeError("ANTHROPIC_API_KEY n'est pas configurée.")
     response = httpx.post(
@@ -188,7 +283,7 @@ def _call_anthropic(prompt: str, model: str | None = None) -> str:
             "output_config": {"effort": "medium"},
             "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=120,
+        timeout=timeout,
     )
     if response.is_error:
         try:
@@ -212,6 +307,11 @@ def _call_anthropic(prompt: str, model: str | None = None) -> str:
     return payload["content"][0]["text"]
 
 
+def _company_id_of(ticket) -> str | None:
+    """Entreprise du client d'un ticket (instantané de ticket ou objet ORM)."""
+    return getattr(ticket, "company_id", None) or getattr(getattr(ticket, "customer", None), "company_id", None)
+
+
 def _with_trace_context(ticket: Ticket, actor_id: str | None):
     ticket_id = getattr(ticket, "id", None)
     customer_id = getattr(ticket, "customer_id", None)
@@ -224,26 +324,48 @@ def _with_trace_context(ticket: Ticket, actor_id: str | None):
     })
 
 
+def _set_preference(preference: dict | None):
+    return _preference_context.set(preference or None)
+
+
+def _reset_preference(token) -> None:
+    _preference_context.reset(token)
+
+
+def set_untracked_trace_context(user_id: str):
+    """Trace un appel IA hors ticket (console d'aide) : facturé à l'utilisateur, sans ticket associé."""
+    return _trace_context.set({"ticket_id": None, "customer_id": user_id, "actor_id": user_id})
+
+
+def reset_trace_context(token) -> None:
+    _reset_trace_context(token)
+
+
 def _reset_trace_context(token) -> None:
     if token is not None:
         _trace_context.reset(token)
 
 
-def _analyze(state: AnalysisState) -> AnalysisState:
-    prompt = _prompt(state)
-    raw, provider, model = _call_provider(prompt, "ticket_analysis", "staff")
+def _parse_analysis(raw: str) -> dict:
     # The model is asked for JSON; reject malformed output rather than inventing an answer.
     result = json.loads(raw)
     if not isinstance(result, dict):
         raise ValueError("La réponse IA n'est pas un objet JSON.")
-    if result.get("priority") not in {"low", "medium", "high", "critical"}:
+    result["priority"] = _normalize_priority(result.get("priority"))
+    if result["priority"] is None:
         raise ValueError("La réponse IA ne contient pas de priorité valide.")
-    recommendations = result.get("recommendations")
-    if not isinstance(recommendations, list) or not all(isinstance(item, str) for item in recommendations):
+    result["recommendations"] = _normalize_recommendations(result.get("recommendations"))
+    if result["recommendations"] is None:
         raise ValueError("La réponse IA ne contient pas de recommandations valides.")
+    result["escalation_recommended"] = _coerce_bool(result.get("escalation_recommended"))
     if not isinstance(result.get("summary"), str) or not isinstance(result.get("escalation_recommended"), bool):
         raise ValueError("La réponse IA ne respecte pas le format attendu.")
-    return {"result": result, "provider": provider, "model": model}
+    return result
+
+
+def _analyze(state: AnalysisState) -> AnalysisState:
+    raw, provider, model = _call_provider(_prompt(state), "ticket_analysis", "staff", _parse_analysis)
+    return {"result": _parse_analysis(raw), "provider": provider, "model": model}
 
 
 def _conversation_prompt(state: CustomerConversationState) -> str:
@@ -279,26 +401,27 @@ Conversation:
 {transcript}"""
 
 
-def _customer_response(state: CustomerConversationState) -> CustomerConversationState:
-    client_turns = sum(item["role"] == "client" for item in state.get("conversation", []))
-    task = "ticket_analysis" if client_turns <= 1 else "customer_diagnosis"
-    raw, provider, model = _call_provider(_conversation_prompt(state), task, "customer")
+def _parse_customer_result(raw: str) -> dict:
     result = json.loads(raw)
     if not isinstance(result, dict):
         raise ValueError("La réponse IA n'est pas un objet JSON.")
     if not isinstance(result.get("reply"), str) or not result["reply"].strip():
         raise ValueError("La réponse IA ne contient pas de message.")
-    if result.get("priority") not in {"low", "medium", "high", "critical"}:
-        raise ValueError("La réponse IA ne contient pas de priorité valide.")
-    if not isinstance(result.get("recommendations"), list) or not all(
-        isinstance(item, str) for item in result["recommendations"]
-    ):
-        raise ValueError("La réponse IA ne contient pas de recommandations valides.")
-    if not isinstance(result.get("resolved"), bool) or not isinstance(
-        result.get("escalation_recommended"), bool
-    ):
-        raise ValueError("La réponse IA ne respecte pas le format attendu.")
-    return {"result": result, "provider": provider, "model": model}
+    # Seul le message au client est indispensable. Les champs secondaires, que les petits modèles
+    # oublient ou formatent mal, reçoivent une valeur sûre : priorité inchangée (None), aucune
+    # recommandation, ni « résolu » ni escalade.
+    result["priority"] = _normalize_priority(result.get("priority"))
+    result["recommendations"] = _normalize_recommendations(result.get("recommendations")) or []
+    result["resolved"] = _flag(result.get("resolved"))
+    result["escalation_recommended"] = _flag(result.get("escalation_recommended"))
+    return result
+
+
+def _customer_response(state: CustomerConversationState) -> CustomerConversationState:
+    client_turns = sum(item["role"] == "client" for item in state.get("conversation", []))
+    task = "ticket_analysis" if client_turns <= 1 else "customer_diagnosis"
+    raw, provider, model = _call_provider(_conversation_prompt(state), task, "customer", _parse_customer_result)
+    return {"result": _parse_customer_result(raw), "provider": provider, "model": model}
 
 
 def _agent_answer(state: AgentAssistState) -> AgentAssistState:
@@ -359,6 +482,7 @@ agent_assist_graph = _agent_builder.compile()
 
 def analyze_ticket(ticket: Ticket) -> dict:
     trace_token = _with_trace_context(ticket, getattr(ticket, "customer_id", None))
+    company_token = set_company_scope(_company_id_of(ticket))
     try:
         state = analysis_graph.invoke({
             "title": ticket.title,
@@ -372,11 +496,14 @@ def analyze_ticket(ticket: Ticket) -> dict:
     except (httpx.HTTPError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         raise AIAnalysisError(f"Analyse IA impossible : {exc}") from exc
     finally:
+        reset_company_scope(company_token)
         _reset_trace_context(trace_token)
 
 
 def respond_to_customer(ticket: Ticket, conversation: list[dict[str, str]], attachment_names: list[str]) -> dict:
     trace_token = _with_trace_context(ticket, getattr(ticket, "customer_id", None))
+    preference_token = _set_preference(getattr(ticket, "ai_preferences", None))
+    company_token = set_company_scope(_company_id_of(ticket))
     try:
         state = customer_conversation_graph.invoke({
             "title": ticket.title,
@@ -392,7 +519,39 @@ def respond_to_customer(ticket: Ticket, conversation: list[dict[str, str]], atta
     except (httpx.HTTPError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         raise AIAnalysisError(f"Réponse de l’assistant IA impossible : {exc}") from exc
     finally:
+        reset_company_scope(company_token)
+        _reset_preference(preference_token)
         _reset_trace_context(trace_token)
+
+
+def help_console_answer(prompt: str, user_id: str, preference: dict | None = None, role: str = "staff") -> tuple[str, str, str, str]:
+    """Réponse libre de la console d'aide (hors ticket) : mesurée au nom de l'utilisateur, sans événement de ticket.
+
+    Retourne (réponse, fournisseur, modèle, raisonnement du modèle si exposé).
+    """
+    trace_token = set_untracked_trace_context(user_id)
+    preference_token = _set_preference(preference)
+    json_token = _json_format.set(False)
+    thinking_token = _provider_thinking.set("")
+    try:
+        answer, provider, model = _call_provider(
+            prompt, ROLE_DEFAULT_TASK.get(role, "agent_assistance"), role, validate=lambda text: _require_text(text),
+        )
+        return answer.strip(), provider, model, _provider_thinking.get()
+    except AIRoutingDisabledError:
+        raise
+    except (httpx.HTTPError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        raise AIAnalysisError(f"Assistance IA impossible : {exc}") from exc
+    finally:
+        _provider_thinking.reset(thinking_token)
+        _json_format.reset(json_token)
+        _reset_preference(preference_token)
+        reset_trace_context(trace_token)
+
+
+def _require_text(text: str) -> None:
+    if not text.strip():
+        raise ValueError("La réponse IA est vide.")
 
 
 def assist_agent(
@@ -403,8 +562,11 @@ def assist_agent(
     task: str = "agent_assistance",
     role: str = "staff",
     actor_id: str | None = None,
+    preference: dict | None = None,
 ) -> str:
     trace_token = _with_trace_context(ticket, actor_id)
+    preference_token = _set_preference(preference)
+    company_token = set_company_scope(_company_id_of(ticket))
     try:
         return agent_assist_graph.invoke({
             "title": ticket.title,
@@ -422,4 +584,6 @@ def assist_agent(
     except (httpx.HTTPError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         raise AIAnalysisError(f"Assistance IA agent impossible : {exc}") from exc
     finally:
+        reset_company_scope(company_token)
+        _reset_preference(preference_token)
         _reset_trace_context(trace_token)

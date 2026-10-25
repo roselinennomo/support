@@ -8,9 +8,9 @@
 4. Depuis la racine du projet : `docker compose up --build`.
 5. Ouvrir <http://localhost:8080>. Les logs s'affichent dans Docker Desktop ou via `docker compose logs -f api web db ollama`.
 
-Au premier lancement, Ollama télécharge `qwen3:4b` et `nomic-embed-text` dans le volume `ollama-data`, en parallèle du démarrage de l'API et de l'interface. Qdrant conserve les vecteurs dans `qdrant-data`; le dossier `support_docs` de la racine est partagé en écriture avec l'API pour permettre aux administrateurs d'y déposer des documents. La taille des téléchargements et les performances varient selon la machine. Tant que les modèles ou Qdrant ne sont pas disponibles, les analyses RAG peuvent échouer, mais le portail reste accessible et les tickets sont conservés. Une machine disposant de peu de mémoire peut nécessiter un modèle Qwen3 plus petit configuré dans `.env`. Les modèles locaux ne requièrent pas de clé API.
+Au premier lancement, deux instances Ollama téléchargent leurs modèles en parallèle : `ollama` (chat : `deepseek-r1:1.5b` et `qwen3:4b`, volume `ollama-data`) et `ollama-embed` (embeddings : `qwen3-embedding:0.6b`, `bge-m3` et `qwen3-embedding:4b`, volume `ollama-embed-data`), en parallèle du démarrage de l'API et de l'interface. Qdrant conserve les vecteurs dans `qdrant-data`; le dossier `support_docs` de la racine est partagé en écriture avec l'API pour permettre aux administrateurs d'y déposer des documents. La taille des téléchargements et les performances varient selon la machine. Tant que les modèles ou Qdrant ne sont pas disponibles, les analyses RAG peuvent échouer, mais le portail reste accessible et les tickets sont conservés. Une machine disposant de peu de mémoire peut nécessiter un modèle Qwen3 plus petit configuré dans `.env`. Les modèles locaux ne requièrent pas de clé API.
 
-`docker compose up --build` démarre les services `db`, `ollama`, `ollama-model`, `qdrant`, `api` et `web` automatiquement. Seuls PostgreSQL prêt et le démarrage sain de l'API conditionnent les services en aval; le téléchargement des modèles et l'indexation documentaire ne sont pas des prérequis au lancement du portail. Le service `ollama-model` qui termine avec le code `0` est un conteneur de tâche ponctuelle et son état `Exited (0)` est normal.
+`docker compose up --build` démarre les services `db`, `ollama`, `ollama-model`, `ollama-embed`, `ollama-embed-model`, `qdrant`, `api` et `web` automatiquement. Seuls PostgreSQL prêt et le démarrage sain de l'API conditionnent les services en aval; le téléchargement des modèles et l'indexation documentaire ne sont pas des prérequis au lancement du portail. Les services `ollama-model` et `ollama-embed-model` qui terminent avec le code `0` sont des conteneurs de tâche ponctuelle et leur état `Exited (0)` est normal.
 
 Arrêt sans effacer les données : `docker compose down`. Effacement des tickets, comptes et modèle téléchargé : `docker compose down -v` — opération irréversible.
 
@@ -24,10 +24,17 @@ Arrêt sans effacer les données : `docker compose down`. Effacement des tickets
 | `INITIAL_ADMIN_PASSWORD` | `ChangeMe123!` | Mot de passe de l'administrateur initial. À modifier impérativement avant le démarrage. |
 | `AI_PROVIDER` | `ollama` | `ollama` ou `anthropic`. |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | URL de l'API Ollama. Dans Compose, `http://ollama:11434`. |
-| `OLLAMA_MODEL` | `qwen3:4b` | Modèle local à télécharger et à utiliser. |
-| `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Modèle Ollama utilisé pour produire les vecteurs RAG, y compris avec Anthropic. Le modèle configuré doit produire `RAG_EMBEDDING_DIMENSION` dimensions. |
+| `OLLAMA_MODEL` | `deepseek-r1:1.5b` | Modèle local par défaut, à télécharger et à utiliser tant que l'administrateur n'a pas enregistré sa propre configuration. |
+| `OLLAMA_THINK` | `true` | Raisonnement activé par défaut pour le modèle Ollama de la configuration initiale. |
+| `OLLAMA_TIMEOUT_SECONDS` | `300` | Délai maximal par défaut d'un appel Ollama dans la configuration initiale (10 à 1800). |
+| `OLLAMA_EXTRA_MODELS` | `qwen3:4b` | Modèles Ollama supplémentaires, séparés par des espaces : téléchargés par `ollama-model` et, dans la configuration initiale, affectés à chaque règle après le modèle principal (sans raisonnement). Ils sont ainsi proposés aux clients et aux agents. |
+| `OLLAMA_KEEP_ALIVE` | `30m` | Durée de maintien du modèle en mémoire après un appel (évite le rechargement à froid). |
+| `OLLAMA_NUM_CTX` | `8192` | Taille de contexte demandée à Ollama, pour éviter la troncature silencieuse des prompts incluant les extraits RAG. |
+| `OLLAMA_EMBEDDING_BASE_URL` | `http://ollama-embed:11434` dans Compose | Instance Ollama dédiée aux embeddings. Vide : l'instance de chat (`OLLAMA_BASE_URL`) est utilisée. |
+| `OLLAMA_EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | Modèle d'embedding initial, utilisé tant que l'administrateur n'en a pas choisi un autre dans la page RAG (y compris avec Anthropic). |
+| `OLLAMA_EXTRA_EMBEDDING_MODELS` | `bge-m3 qwen3-embedding:4b` | Autres modèles d'embedding téléchargés par `ollama-embed-model` et sélectionnables dans la page RAG. |
 | `RAG_COLLECTION` | `support_documents` | Collection Qdrant du corpus. |
-| `RAG_EMBEDDING_DIMENSION` | `768` | Dimension attendue du modèle d'embedding `nomic-embed-text`. |
+| `RAG_EMBEDDING_DIMENSION` | `1024` | Dimension utilisée uniquement pour un modèle absent du catalogue (Qwen3 Embedding 0.6B/4B et BGE-M3 ont leur dimension connue : 1024, 2560, 1024). |
 | `RAG_TOP_K` | `5` | Nombre maximal d'extraits documentaires transmis à l'IA. |
 | `RAG_SCORE_THRESHOLD` | `0.35` | Score minimal de similarité Qdrant; les résultats plus faibles ne sont pas fournis au modèle. |
 | `ANTHROPIC_API_KEY` | vide | Clé API si `AI_PROVIDER=anthropic`. À ne jamais publier dans le dépôt ou dans l'interface. |
@@ -36,6 +43,8 @@ Arrêt sans effacer les données : `docker compose down`. Effacement des tickets
 | `UPLOAD_DIR` | `./uploads` | Répertoire des pièces jointes; Compose le monte sur le volume `support-uploads`. |
 | `MAX_ATTACHMENT_SIZE` | `10485760` | Taille maximale en octets par fichier (10 Mio par défaut). |
 | `MAX_ATTACHMENTS_PER_UPLOAD` | `5` | Nombre maximal de fichiers dans un envoi. |
+| `RAG_MAX_FILE_SIZE` | `52428800` | Taille maximale en octets par document du corpus RAG (50 Mio). Distincte des pièces jointes de tickets. |
+| `RAG_MAX_FILES_PER_UPLOAD` | `50` | Nombre maximal de documents du corpus RAG dans un envoi. |
 
 Les variables d'environnement du système prennent priorité sur le fichier `.env`. Compose lit également ce fichier pour les substitutions `${...}`.
 
@@ -77,9 +86,47 @@ Pour le compte de démonstration, les adresses internes en `.local` (par exemple
 
 Dans `.env`, choisir `AI_PROVIDER=anthropic` et renseigner `ANTHROPIC_API_KEY`. Redémarrer l'API avec `docker compose up -d --build api`. Le service Ollama continue d'exister dans le Compose de développement mais n'est pas appelé par le graphe Anthropic.
 
+### Enrichissement par la KB constructeur
+
+Optionnel et désactivé par défaut (`ENABLE_KB_BROWSER_SCRAPER=false`). Activation, connexion MFA via noVNC, sélecteurs CSS, métriques et dépannage : voir `docs/kb-scraper.md`. Le navigateur est dans le profil Compose `kb` (`docker compose --profile kb up -d`); son profil Chromium est conservé dans le volume `kb-browser-profile` (à sauvegarder comme les autres volumes : il contient une session authentifiée). Variables : `ENABLE_KB_BROWSER_SCRAPER`, `KB_BROWSER_URL`, `KB_BROWSER_TOKEN`, `KB_LOGIN_URL`, `KB_MAX_ARTICLES` (API) et `KB_BASE_URL`, `KB_*_SELECTOR`, `KB_BROWSER_VNC_PASSWORD` (navigateur).
+
+### Que sauvegarder avant de tout supprimer ?
+
+Les documents d'entreprise gardent leurs fichiers originaux dans `company_docs/` (voir `company-docs.md`). `docker compose down -v` supprime tous les volumes (tickets, comptes, vecteurs, modèles Ollama, session du navigateur KB). Seuls les dossiers du projet survivent : `support_docs/` (corpus RAG) et `kb_archive/` (éléments de la KB constructeur avec leurs fichiers originaux, restaurés automatiquement au démarrage; voir `kb-scraper.md`). Pour conserver aussi les tickets et les comptes : `docker compose exec -T db pg_dump -U support support > sauvegarde.sql`. Les vecteurs et les modèles se recalculent ou se retéléchargent.
+
+### Choisir le modèle d'embedding et supprimer des documents
+
+> **Performance** : l'indexation d'un gros corpus est coûteuse en CPU. L'instance `ollama-embed` est plafonnée (`OLLAMA_EMBED_CPUS`, 3 par défaut) pour ne pas affamer le chat, et la réponse IA n'attend jamais une réindexation volumineuse : au-delà de 2 documents à mettre à jour, la synchronisation passe en arrière-plan et la recherche utilise l'index partiel jusqu'à la fin. Après un changement de modèle d'embedding, les réponses IA s'appuient donc sur un corpus incomplet tant que l'indexation n'est pas terminée (suivi dans la page Corpus RAG). Les tickets laissés « en réflexion » par un redémarrage de l'API sont relancés automatiquement au démarrage.
+
+Dans **Corpus RAG**, la section **Modèle d'embedding** propose Qwen3 Embedding 0.6B (défaut), BGE-M3 et Qwen3 Embedding 4B. Un modèle non téléchargé sur l'instance `ollama-embed` est grisé (`docker compose exec ollama-embed ollama pull <modèle>`). Le changement lance la réindexation du corpus dans la collection de ce modèle (`support_documents_<modèle>`); l'ancienne collection est conservée et réutilisable, mais n'est plus alimentée. Le 4B donne en général de meilleurs résultats au prix d'une indexation nettement plus lente et d'environ 2,5 Go de mémoire.
+
+Les documents se suppriment un par un ou par sélection multiple dans **Documents du corpus**. La suppression retire le fichier de `support_docs` et ses extraits de la collection active; les autres collections sont nettoyées à leur prochaine synchronisation. Elle est refusée pendant une indexation. Si Qdrant est indisponible, le fichier est tout de même supprimé et l'index est nettoyé à la synchronisation suivante.
+
+Après la mise à jour depuis une version utilisant `nomic-embed-text`, le nouveau modèle utilise une nouvelle collection vide : lancer **Synchroniser l'index**. L'ancienne collection `support_documents` peut être supprimée de Qdrant.
+
+### Erreur 413 lors d'un envoi de fichiers
+
+Trois limites s'appliquent et doivent rester cohérentes :
+
+1. **nginx** (`frontend/nginx.conf`, `client_max_body_size`) : taille totale de la requête. 2560 Mo pour `/api/admin/rag/documents` (50 × 50 Mio) et 60 Mo pour le reste de l'API (5 × 10 Mio). Sans cette directive nginx n'accepte que 1 Mo et répond une page HTML « 413 Request Entity Too Large ».
+2. **API, nombre de fichiers** : `RAG_MAX_FILES_PER_UPLOAD` (corpus) ou `MAX_ATTACHMENTS_PER_UPLOAD` (tickets).
+3. **API, taille par fichier** : `RAG_MAX_FILE_SIZE` (corpus) ou `MAX_ATTACHMENT_SIZE` (tickets). Le message d'erreur est alors en français et nomme le document.
+
+Si vous relevez les variables de l'API, relevez aussi `client_max_body_size` (nombre de fichiers × taille maximale), puis `docker compose up -d --build web api`. Le corpus est écrit sur disque par blocs : un envoi de 2,5 Go ne charge pas 2,5 Go en mémoire, mais exige l'espace disque correspondant dans `support_docs`.
+
+### Activer la recherche web de la console d'aide
+
+La console d'aide (`help-console.md`) peut compléter ses réponses par une recherche web gratuite via une instance **SearXNG** auto-hébergée, jamais fournie par défaut. Déployer SearXNG avec le format JSON autorisé (`search.formats: [html, json]` dans `settings.yml`), puis renseigner `WEB_SEARCH_URL` (par exemple `http://searxng:8080`) dans `.env` et relancer `docker compose up -d api`. Tant que la variable est vide, la case « Recherche web » est grisée. Seule la question, expurgée des e-mails, adresses IP/MAC et numéros de téléphone, est envoyée.
+
 ### Configurer un modèle Ollama différent
 
-Changer `OLLAMA_MODEL` dans `.env`, par exemple un autre modèle Qwen3 adapté à la mémoire disponible, puis lancer `docker compose up -d ollama-model api`. Si le nom du modèle est modifié, le nouveau modèle sera téléchargé et conservé dans le volume Ollama.
+Changer `OLLAMA_MODEL` dans `.env`, par exemple un autre modèle Qwen3 adapté à la mémoire disponible, puis lancer `docker compose up -d ollama-model api`. Si le nom du modèle est modifié, le nouveau modèle sera téléchargé et conservé dans le volume Ollama. Pour télécharger d'autres modèles sans changer le modèle par défaut, les lister dans `OLLAMA_EXTRA_MODELS` (`qwen3:4b` par défaut).
+
+Les variables `OLLAMA_*` ne définissent que la configuration IA **initiale**. Dès que l'administrateur enregistre **Configuration IA**, la configuration en base prévaut. Le bouton **Rétablir les valeurs par défaut** (ou `DELETE /api/admin/ai-routing`) supprime la configuration enregistrée et réapplique ces variables.
+
+### Régler le raisonnement (think) et le délai par modèle
+
+Dans **Configuration IA**, chaque modèle affecté à une règle expose deux réglages : **Raisonnement (think)** et **Délai max (s)** (10 à 1800 s; 120 s si le champ est absent d'une ancienne configuration). La configuration initiale applique `OLLAMA_THINK` et `OLLAMA_TIMEOUT_SECONDS`. Sur CPU, le raisonnement de qwen3 est particulièrement coûteux ; le désactiver pour ce modèle sauf besoin précis : le raisonnement caché peut représenter plus de 90 % des tokens générés (11 minutes mesurées avec qwen3:4b sur CPU pour un ticket de test, dont ~3 300 tokens de raisonnement pour ~200 de réponse utile). Augmenter le délai pour un modèle lent ou lorsque `think` est activé. Le délai est toujours celui de l'administrateur : les utilisateurs ne peuvent choisir ni le délai ni un modèle absent de la configuration. Le proxy nginx du frontend attend jusqu'à 300 s.
 
 ## Dépannage
 
@@ -104,7 +151,7 @@ Changer `OLLAMA_MODEL` dans `.env`, par exemple un autre modèle Qwen3 adapté �
 - Les tâches FastAPI en arrière-plan ne survivent pas à un redémarrage du conteneur. Si l'état reste `pending`, inspecter les logs API et utiliser le transfert manuel pour ne pas bloquer la prise en charge; pour une charge de production, utiliser une file durable.
 - Confirmer que `AI_PROVIDER` est `ollama` et que `OLLAMA_BASE_URL` est `http://ollama:11434`.
 - Vérifier si `ollama-model` a terminé et si le modèle est présent : `docker compose exec ollama ollama list`.
-- Le RAG requiert également Qdrant et `nomic-embed-text`. Vérifier `docker compose logs --tail=100 qdrant api ollama-model`, `docker compose ps` et que `nomic-embed-text` apparaît dans `docker compose exec ollama ollama list`. Une incompatibilité de dimension d'embedding ou un Qdrant indisponible est consigné dans les logs API.
+- Le RAG requiert également Qdrant et le modèle d'embedding actif sur l'instance dédiée. Vérifier `docker compose logs --tail=100 qdrant api ollama-embed ollama-embed-model`, `docker compose ps` et que le modèle apparaît dans `docker compose exec ollama-embed ollama list`. Une incompatibilité de dimension d'embedding ou un Qdrant indisponible est consigné dans les logs API.
 - Si les réponses ne citent pas de documentation utile, vérifier que les documents sont bien dans `support_docs/` et que leur PDF contient du texte sélectionnable; inspecter les logs `api` lors de la synchronisation.
 - Sur une machine sans ressources suffisantes, employer un modèle plus petit ou Anthropic.
 - Pour Anthropic, vérifier la clé, les droits de compte, le nom du modèle et l'accès Internet du conteneur API.

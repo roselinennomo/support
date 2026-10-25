@@ -6,6 +6,10 @@ Ouvrir l'adresse fournie par l'administrateur. Les comptes agent et administrate
 
 Les mots de passe doivent comporter au moins 10 caractères. Après connexion, l'écran s'adapte au rôle. Le bouton de déconnexion est accessible en bas du menu latéral.
 
+
+### Menu de navigation
+
+Le menu de gauche est organisé en groupes selon votre profil : **Support** (file ou demandes, console d'aide), **Entreprise** (entreprises, utilisateurs, demandes d'accès, documents), **Service & facturation**, **Connaissances** (corpus RAG, KB constructeur), **Intelligence artificielle** (configuration, évaluation, coûts, diagnostic), **Système** (supervision) et **Mon compte**. Les groupes sans entrée pour votre profil sont masqués. Le bouton « Réduire » en haut du menu ne garde que les icônes (survolez-les pour le nom, un badge indique les demandes d'accès en attente); votre choix est mémorisé.
 ## Client
 
 ### Demander un accès client
@@ -14,6 +18,12 @@ Les mots de passe doivent comporter au moins 10 caractères. Après connexion, l
 2. Depuis l’écran de connexion, cliquer sur **Demander un accès** et renseigner le code, votre nom, votre adresse e-mail et un mot de passe.
 3. Votre demande apparaît dans la file de validation des agents affectés à l’entreprise.
 4. Après vérification, un agent ou un administrateur approuve ou refuse la demande. En cas d’approbation, connectez-vous avec l’adresse e-mail et le mot de passe choisis.
+
+Une fois le compte approuvé, vous voyez tous les incidents de votre entreprise, y compris ceux créés par vos collègues, et vous pouvez y répondre ou ajouter des pièces jointes. Les clients des autres entreprises n'y ont jamais accès.
+
+Les listes longues (incidents, utilisateurs, entreprises, demandes d'accès, documents du corpus, recherches KB, coûts et traces IA, factures) sont paginées : la barre sous la liste indique la plage affichée, permet d'aller à la première, précédente, suivante ou dernière page, de choisir une page numérotée et de régler le nombre d'éléments par page; ce réglage est mémorisé par liste dans le navigateur. Un changement de filtre ou de recherche ramène à la première page.
+
+Pendant le diagnostic guidé, vous pouvez choisir le **modèle IA** et activer ou non le **raisonnement** (réponse plus approfondie mais plus lente) depuis le formulaire de création, puis depuis le panneau de diagnostic tant que l’assistant ne travaille pas. Seuls les modèles proposés par l’administrateur apparaissent; si aucun choix n’est affiché, le modèle par défaut est utilisé.
 
 Un compte en attente ou refusé ne peut pas se connecter ni créer d’incident. Si la demande tarde, contactez le support en indiquant l’entreprise et l’adresse e-mail utilisées.
 
@@ -38,7 +48,7 @@ La page **Mes demandes** présente les demandes et leur statut :
 - **Nouveau** : reçu par l'équipe.
 - **En cours** : pris en charge.
 - **En attente client** : une information ou action est attendue de votre part.
-- **Escaladé** : transmis à une équipe experte; la fiche conserve le suivi et affiche l'équipe et, si disponible, la référence externe.
+- **Escaladé** : statut hérité d'anciennes versions (escalade manuelle supprimée), conservé pour les tickets existants, qui peuvent en sortir normalement.
 - **Résolu** : l'agent (ou l'assistant IA) a proposé une résolution documentée. Vérifiez la note; répondez pour rouvrir ou confirmez pour clôturer.
 - **Clôturé** : vous avez confirmé que le traitement est terminé. Un ticket clôturé ne peut pas être rouvert.
 - **Rejeté** : l'équipe ne peut pas prendre en charge la demande; le motif est communiqué. Créez une nouvelle demande si nécessaire.
@@ -58,14 +68,28 @@ Dans une fiche, l'agent peut :
 - répondre dans la conversation (message visible au client);
 - consulter et télécharger les pièces jointes reçues;
 - activer **Note interne** avant l'envoi pour ajouter un échange réservé à l'équipe;
-- demander une aide IA privée à partir de tout l'historique du ticket et du corpus documentaire; la réponse est enregistrée comme note interne et peut citer les références utilisées;
+- demander une aide IA privée à partir de tout l'historique du ticket et du corpus documentaire; la réponse est enregistrée comme note interne et peut citer les références utilisées. Le bouton **Résumer le ticket** produit un résumé de l’état et des prochaines vérifications. Dans les deux cas, vous choisissez le modèle IA (et le raisonnement) parmi ceux que l’administrateur a affectés à l’équipe support;
+- assigner le ticket (bloc « Prise en charge ») : un agent peut se l'assigner ou l'assigner à un collègue affecté à la même entreprise; seul un administrateur peut l'assigner à un administrateur (qui le prend à titre exceptionnel). Un client n'est jamais assignable;
 - consulter le diagnostic IA, sans le considérer comme une preuve ou une procédure validée;
 - recevoir automatiquement, lors d'un transfert client après au moins un échange avec l'IA, une note interne résumant l'historique et proposant les premières recommandations; en cas d'échec IA, une note interne invite à consulter l'historique;
-- enregistrer une escalade avec une équipe destinataire, un motif et une référence de suivi si connue.
-
-L'escalade change le statut en **Escaladé** et inscrit l'événement dans la chronologie. Le ticket ne disparaît pas de l'espace du client. Les notes internes ne doivent pas contenir d'informations non pertinentes ou de secrets.
+Il n'y a pas d'escalade manuelle entre agents : l'escalade est le transfert de l'IA vers le support (voir ci-dessus). Les notes internes ne doivent pas contenir d'informations non pertinentes ou de secrets.
 
 Les pièces jointes sont actuellement fournies au modèle par leur nom uniquement, pas par leur contenu. Téléchargez et examinez les fichiers vous-même avant de demander une analyse IA complémentaire.
+
+### Client indépendant
+
+Sans entreprise partagée, cochez « Je suis un client indépendant » à l'inscription : un espace individuel est créé, activé après validation de l'administrateur, avec sa propre facturation et l'accès à la Console d'aide (voir `independent-clients.md`).
+
+### Console d'aide
+
+Le menu « Console d'aide » ouvre un assistant technique indépendant des tickets (agents et administrateurs). Cliquez sur « Nouvelle conversation », puis choisissez :
+
+- un **ticket** (facultatif) : son contexte est copié dans la conversation, sans le modifier; « Actualiser le ticket » recopie son état courant;
+- une **entreprise** (facultatif, une seule par conversation) : ses documents privés s'ajoutent à la documentation Alcatel;
+- les sources complémentaires : **recherche en direct sur le portail constructeur** et **recherche web** (seule votre question, sans e-mail ni adresse IP, est envoyée);
+- le **modèle IA** et le raisonnement.
+
+Chaque réponse cite ses sources. Vos conversations sont personnelles, conservées dans l'historique (recherche, pagination, suppression). Détails : `help-console.md`.
 
 ## Administrateur
 
@@ -73,7 +97,7 @@ L'administrateur dispose des fonctionnalités agent, d'une page **Équipe** et d
 
 1. Saisir le nom, l'adresse e-mail, un mot de passe temporaire (10 caractères minimum) et le rôle.
 2. Créer un compte **Agent support** ou **Administrateur**.
-3. Consulter la console de supervision pour vérifier l'état de la base, de l'API, d'Ollama, du RAG documentaire et de la file de support.
+3. Consulter la console de supervision pour vérifier l'état de la base, de l'API, d'Ollama (génération), d'Ollama (embeddings), de Qdrant (RAG documentaire) et de la file de support.
 4. Communiquer le compte par un canal approprié et demander au collaborateur de changer son mot de passe hors bande lorsque la politique interne le permet.
 
 Le formulaire gère la création des comptes uniquement; désactivation, réinitialisation de mot de passe et gestion de sessions ne sont pas encore incluses dans cette version.
@@ -84,7 +108,7 @@ La page **Supervision** affiche :
 
 - les incidents ouverts et escaladés;
 - le nombre de comptes actifs et d'utilisateurs de la plateforme;
-- l'état de la base de données, de l'API, du service Ollama, du service RAG (Qdrant et modèle d'embedding) et de la file de traitement.
+- l'état de la base de données, de l'API, du service Ollama de génération, de l'instance Ollama d'embeddings (modèle actif et téléchargement), de Qdrant (collection du modèle actif) et de la file de traitement. Le **Diagnostic IA** présente les mêmes éléments d'embeddings et de Qdrant, et **Coûts IA** propose les modèles Ollama détectés dans une liste déroulante pour saisir les tarifs.
 
 Cette vue aide l'administration à repérer rapidement un dysfonctionnement ou une saturation du support sans quitter le portail.
 

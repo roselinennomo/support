@@ -4,10 +4,11 @@
 
 ```text
 Navigateur (React/Vite) ── Nginx :8080 ── FastAPI :8000 ── PostgreSQL :5432
-                                            ├── LangGraph ── Ollama :11434 (Qwen3 par défaut)
-                                            │                    └── embeddings nomic-embed-text
+                                            ├── LangGraph ── Ollama « chat » :11434 (deepseek-r1:1.5b par défaut, qwen3:4b disponible)
                                             ├── LangGraph ── Anthropic Messages API (option)
-                                            └── RAG ── Qdrant :6333
+                                            ├── KB (option) ── kb-browser :8090 (Playwright, profil persistant) ── KB constructeur
+                                            └── RAG ── Ollama « embed » :11434 (qwen3-embedding:0.6b par défaut, bge-m3, qwen3-embedding:4b)
+                                                   ├── Qdrant :6333 (une collection par modèle d'embedding)
                                                    └── ./support_docs (PDF, Markdown, texte)
 ```
 
@@ -17,7 +18,7 @@ L'application est découpée en trois services de déploiement :
 - `backend/app/` : API REST FastAPI, validation Pydantic, authentification JWT et autorisations par rôle.
 - PostgreSQL : utilisateurs, tickets, messages, pièces jointes (métadonnées) et événements. Des volumes Compose conservent les données et les fichiers entre redémarrages.
 
-Ollama tourne dans son propre conteneur; le service `ollama-model` télécharge le modèle de conversation configuré et `nomic-embed-text` pour le RAG. Qdrant persiste les vecteurs dans le volume `qdrant-data`. LangGraph fournit des graphes distincts pour le diagnostic conversationnel du client, l'aide IA privée à l'agent et l'analyse structurée historique. Le routage de génération est persisté en base par tâche et rôle, avec ordre de priorité, repli vers le modèle suivant et interrupteur général. Chaque client dispose de consentements séparés (traitement IA et conservation des traces), activés par défaut. La table `ai_executions` enregistre les tokens, la durée, le modèle, le ticket et les acteurs; le prompt et la réponse ne sont conservés que si le consentement aux traces est actif, pour 30 jours maximum. `ai_model_prices` contient les prix USD administrés, utilisés pour les estimations de coûts. Avant chaque génération, `app/rag.py` compare les empreintes SHA-256 des fichiers pris en charge dans `support_docs`, réindexe les fichiers modifiés/ajoutés, retire les sources supprimées, puis cherche les extraits sémantiquement pertinents. Les documents sont découpés par page en extraits avec chevauchement; les réponses reçoivent les références fichier/page associées. Le fournisseur d'embeddings reste Ollama même si le fournisseur de génération est Anthropic.
+Un module optionnel (`backend/app/kb/`, conteneur `kb-browser`) enrichit le RAG avec la KB constructeur dans un index Qdrant séparé; voir `docs/kb-scraper.md`. Deux conteneurs Ollama coexistent : `ollama` (génération) et `ollama-embed` (embeddings RAG); `ollama-model` télécharge les modèles de conversation configurés et `ollama-embed-model` ceux d'embedding. Qdrant persiste les vecteurs dans le volume `qdrant-data`. LangGraph fournit des graphes distincts pour le diagnostic conversationnel du client, l'aide IA privée à l'agent et l'analyse structurée historique. Le routage de génération est persisté en base par tâche et rôle, avec ordre de priorité, repli vers le modèle suivant et interrupteur général. Chaque client dispose de consentements séparés (traitement IA et conservation des traces), activés par défaut. La table `ai_executions` enregistre les tokens, la durée, le modèle, le ticket et les acteurs; le prompt et la réponse ne sont conservés que si le consentement aux traces est actif, pour 30 jours maximum. `ai_model_prices` contient les prix USD administrés, utilisés pour les estimations de coûts. Avant chaque génération, `app/rag.py` compare les empreintes SHA-256 des fichiers pris en charge dans `support_docs`, réindexe les fichiers modifiés/ajoutés, retire les sources supprimées, puis cherche les extraits sémantiquement pertinents. Les documents sont découpés par page en extraits avec chevauchement; les réponses reçoivent les références fichier/page associées. Le fournisseur d'embeddings reste Ollama (instance dédiée) même si le fournisseur de génération est Anthropic.
 
 ## Cycle de vie d'un incident
 
@@ -42,7 +43,7 @@ Les fichiers sont écrits sous `UPLOAD_DIR` avec un nom généré, une liste d'e
 
 ## Rôles et frontières d'accès
 
-- `customer` : associé à une entreprise et approuvé par le support; ne voit et ne modifie que ses tickets, crée des tickets et publie des messages.
+- `customer` : associé à une entreprise et approuvé par le support; voit et complète les tickets de son entreprise (y compris ceux de ses collègues), crée des tickets et publie des messages publics.
 - `agent` : gère les entreprises auxquelles il est affecté, valide les demandes d'accès correspondantes, traite les tickets de leurs clients et administre les comptes clients/agents des entreprises de son périmètre (hors comptes admin et son propre compte).
 - `admin` : mêmes droits support que l'agent sur toutes les entreprises, gestion globale des utilisateurs et paramètres, réinitialisation des mots de passe, configuration de facturation et crédits, et accès à la supervision.
 
@@ -59,6 +60,7 @@ Les adresses suivent la validation standard, avec une exception limitée au suff
 - `app/ai.py` : fournisseurs de modèle, prompts, graphes LangGraph et validation de leurs sorties.
 - `app/tickets.py`, `app/users.py` : opérations métier HTTP.
 - `app/service_management.py` : politiques SLA, consommation des crédits, génération des rapports PDF et facturation.
+- `app/help_console.py`, `app/web_search.py` : console d'aide (conversations personnelles, réponses en tâche de fond, sources citées) et client SearXNG; les appels IA sans ticket sont mesurés avec `ai_executions.ticket_id` vide (voir `help-console.md`).
 - `app/main.py` : assemblage, initialisation de schéma et compte admin initial.
 - `frontend/src/App.jsx` : écrans, navigation et appels HTTP.
 - `frontend/src/styles.css` : système visuel responsive.
@@ -68,7 +70,7 @@ Les adresses suivent la validation standard, avec une exception limitée au suff
 - Monter les documents dans `support_docs` (bind mount en lecture seule dans Compose). Formats indexés : PDF avec texte extractible, `.md`, `.markdown` et `.txt`; les PDF scannés nécessitent un OCR non encore intégré. Une page PDF illisible est ignorée avec un avertissement en log; un fichier sans texte extractible n'alimente pas le contexte.
 - À chaque appel de diagnostic ou d'aide agent, synchroniser le corpus par empreinte, puis intégrer les meilleurs extraits dans le prompt. Le premier appel peut être plus long lors de l'indexation initiale ou après un grand ajout de documents.
 - Qdrant stocke les vecteurs et métadonnées dans le volume `qdrant-data`; les documents originaux restent dans `support_docs`. Pour reconstruire l'index, retirer uniquement le volume vectoriel puis redémarrer; cela supprime l'index, pas le corpus ni les tickets.
-- Les embeddings sont calculés par Ollama avec `nomic-embed-text` (768 dimensions) quelle que soit la configuration du LLM de génération. Le Qdrant du Compose est privé au réseau Docker, sans port publié.
+- Les embeddings sont calculés par une instance Ollama **distincte** de celle du chat (`ollama-embed`, volume `ollama-embed-data`), quelle que soit la configuration du LLM de génération : une indexation volumineuse n'entre pas en concurrence avec les réponses IA et les deux types de modèles ne s'évincent pas de la mémoire. Sans `OLLAMA_EMBEDDING_BASE_URL`, l'API retombe sur l'instance de chat (développement local). L'administrateur choisit le modèle (Qwen3 Embedding 0.6B par défaut, BGE-M3 ou Qwen3 Embedding 4B) dans la page RAG; le choix est conservé en base (`rag_config`). Les vecteurs de modèles différents n'étant pas comparables, chaque modèle a sa collection Qdrant `<RAG_COLLECTION>_<modèle>` et sa dimension (1024, 1024 et 2560) : changer de modèle réindexe le corpus sans détruire l'index précédent. Le Qdrant du Compose est privé au réseau Docker, sans port publié.
 - Le modèle reçoit les extraits retrouvés, pas les fichiers complets. Seuls les documents texte sont indexés; pièces jointes ticket, PDF scannés et images ne sont pas analysés.
 - Vérifier la pertinence sur des incidents réels validés par les experts et retirer/segmenter les documents non pertinents. Le RAG réduit les réponses sans fondement sans garantir leur exactitude; l'IA doit citer les références utiles et signaler les lacunes du corpus.
 

@@ -3,6 +3,7 @@ import logging
 import re
 import threading
 import uuid
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -18,11 +19,75 @@ _sync_lock = threading.Lock()
 _SUPPORTED_EXTENSIONS = {".pdf", ".md", ".markdown", ".txt"}
 _CHUNK_SIZE = 1400
 _CHUNK_OVERLAP = 200
-_EMBED_BATCH_SIZE = 32
+_EMBED_BATCH_SIZE = 8  # petits lots : une requête de recherche n'attend pas derrière un gros lot d'indexation
+# Au-delà, la mise à jour de l'index n'est plus faite pendant la réponse IA mais en arrière-plan.
+_INLINE_SYNC_MAX_SOURCES = 2
+_background_sync_guard = threading.Lock()
+_background_sync_active = False
+
+
+# Modèles d'embedding proposés à l'administrateur (dimension de sortie fixe par modèle).
+EMBEDDING_MODELS = {
+    "qwen3-embedding:0.6b": {"label": "Qwen3 Embedding 0.6B", "dimension": 1024},
+    "bge-m3": {"label": "BGE-M3", "dimension": 1024},
+    "qwen3-embedding:4b": {"label": "Qwen3 Embedding 4B", "dimension": 2560},
+}
+_embedding_model_override: str | None = None
 
 
 class RAGError(RuntimeError):
     pass
+
+
+# Entreprise dont les documents privés peuvent compléter la recherche (posée par l'appelant, jamais déduite de la requête).
+_company_scope: ContextVar[str | None] = ContextVar("rag_company_scope", default=None)
+
+
+def set_company_scope(company_id: str | None):
+    return _company_scope.set(company_id or None)
+
+
+def reset_company_scope(token) -> None:
+    _company_scope.reset(token)
+
+
+def embedding_model() -> str:
+    """Modèle d'embedding actif : choix de l'administrateur, sinon OLLAMA_EMBEDDING_MODEL."""
+    return _embedding_model_override or settings.ollama_embedding_model
+
+
+def set_embedding_model(model: str | None) -> None:
+    global _embedding_model_override
+    if model is not None and model not in EMBEDDING_MODELS:
+        raise RAGError(f"Modèle d'embedding non pris en charge : {model}")
+    _embedding_model_override = model
+
+
+def embedding_dimension() -> int:
+    known = EMBEDDING_MODELS.get(embedding_model())
+    return known["dimension"] if known else settings.rag_embedding_dimension
+
+
+def collection_name() -> str:
+    """Une collection Qdrant par modèle : les vecteurs de modèles différents ne sont pas comparables."""
+    slug = re.sub(r"[^a-z0-9]+", "-", embedding_model().lower()).strip("-")
+    return f"{settings.rag_collection}_{slug}"
+
+
+def model_installed(model: str, installed_names: set[str]) -> bool:
+    """Correspondance exacte (qwen3-embedding:0.6b ≠ :4b); sans étiquette, Ollama ajoute :latest."""
+    return model in installed_names or (":" not in model and f"{model}:latest" in installed_names)
+
+
+def embedding_base_url() -> str:
+    """Instance Ollama dédiée aux embeddings, ou l'instance de chat si aucune n'est séparée."""
+    return (settings.ollama_embedding_base_url or settings.ollama_base_url).rstrip("/")
+
+
+def installed_ollama_models() -> set[str]:
+    response = httpx.get(f"{embedding_base_url()}/api/tags", timeout=3)
+    response.raise_for_status()
+    return {item.get("name", "") for item in response.json().get("models", [])}
 
 
 def _qdrant_request(method: str, path: str, **kwargs) -> httpx.Response:
@@ -37,15 +102,15 @@ def _qdrant_request(method: str, path: str, **kwargs) -> httpx.Response:
 
 
 def _ensure_collection() -> None:
-    collection_path = f"/collections/{settings.rag_collection}"
+    collection_path = f"/collections/{collection_name()}"
     response = httpx.get(f"{settings.rag_qdrant_url.rstrip('/')}{collection_path}", timeout=10)
     if response.status_code == 200:
         collection = response.json()["result"]
         configured_size = collection["config"]["params"]["vectors"]["size"]
-        if configured_size != settings.rag_embedding_dimension:
+        if configured_size != embedding_dimension():
             raise RAGError(
                 f"La collection Qdrant utilise {configured_size} dimensions, "
-                f"mais RAG_EMBEDDING_DIMENSION vaut {settings.rag_embedding_dimension}. "
+                f"mais RAG_EMBEDDING_DIMENSION vaut {embedding_dimension()}. "
                 "Utilisez une collection vide ou adaptez sa configuration."
             )
         return
@@ -56,7 +121,7 @@ def _ensure_collection() -> None:
         collection_path,
         json={
             "vectors": {
-                "size": settings.rag_embedding_dimension,
+                "size": embedding_dimension(),
                 "distance": "Cosine",
             }
         },
@@ -108,8 +173,8 @@ def _chunks(text: str) -> list[str]:
 
 def _embed(texts: list[str]) -> list[list[float]]:
     response = httpx.post(
-        f"{settings.ollama_base_url.rstrip('/')}/api/embed",
-        json={"model": settings.ollama_embedding_model, "input": texts},
+        f"{embedding_base_url()}/api/embed",
+        json={"model": embedding_model(), "input": texts},
         timeout=120,
     )
     response.raise_for_status()
@@ -117,12 +182,12 @@ def _embed(texts: list[str]) -> list[list[float]]:
     if not isinstance(embeddings, list) or len(embeddings) != len(texts):
         raise RAGError("Ollama n'a pas renvoyé un embedding par extrait.")
     if any(
-        not isinstance(vector, list) or len(vector) != settings.rag_embedding_dimension
+        not isinstance(vector, list) or len(vector) != embedding_dimension()
         for vector in embeddings
     ):
         raise RAGError(
-            f"Dimension d'embedding inattendue pour le modèle {settings.ollama_embedding_model}; "
-            f"dimension attendue : {settings.rag_embedding_dimension}."
+            f"Dimension d'embedding inattendue pour le modèle {embedding_model()}; "
+            f"dimension attendue : {embedding_dimension()}."
         )
     return embeddings
 
@@ -133,7 +198,7 @@ def _all_points() -> list[dict]:
     while True:
         response = _qdrant_request(
             "POST",
-            f"/collections/{settings.rag_collection}/points/scroll",
+            f"/collections/{collection_name()}/points/scroll",
             json={
                 "limit": 256,
                 "offset": offset,
@@ -159,7 +224,7 @@ def _index_source(source: str, digest: str, pages: list[tuple[int | None, str]])
         _delete_source(source)
         _qdrant_request(
             "PUT",
-            f"/collections/{settings.rag_collection}/points",
+            f"/collections/{collection_name()}/points",
             params={"wait": "true"},
             json={"points": [{
                 "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{digest}:empty")),
@@ -197,7 +262,7 @@ def _index_source(source: str, digest: str, pages: list[tuple[int | None, str]])
     for batch_start in range(0, len(points), _EMBED_BATCH_SIZE):
         _qdrant_request(
             "PUT",
-            f"/collections/{settings.rag_collection}/points",
+            f"/collections/{collection_name()}/points",
             params={"wait": "true"},
             json={"points": points[batch_start:batch_start + _EMBED_BATCH_SIZE]},
         )
@@ -206,14 +271,29 @@ def _index_source(source: str, digest: str, pages: list[tuple[int | None, str]])
 def _delete_source(source: str) -> None:
     _qdrant_request(
         "POST",
-        f"/collections/{settings.rag_collection}/points/delete",
+        f"/collections/{collection_name()}/points/delete",
         params={"wait": "true"},
         json={"filter": {"must": [{"key": "source", "match": {"value": source}}]}},
     )
 
 
+def delete_sources(sources: list[str]) -> None:
+    """Retire des sources de la collection active; une collection absente n'a rien à retirer."""
+    try:
+        with _sync_lock:
+            for source in sources:
+                try:
+                    _delete_source(source)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code != 404:
+                        raise
+    except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError) as exc:
+        raise RAGError(f"Échec de la suppression dans l'index RAG : {exc}") from exc
+
+
 def _sync_documents(
     progress_callback: Callable[[dict[str, str | int]], None] | None = None,
+    max_sources: int | None = None,
 ) -> dict[str, int]:
     root = Path(settings.rag_documents_dir).resolve()
     if not root.is_dir():
@@ -251,6 +331,9 @@ def _sync_documents(
         if existing.get(source) != digest
     ]
     total = len(deleted_sources) + len(changed_sources)
+    if max_sources is not None and total > max_sources:
+        # Trop de travail pour une réponse en direct : l'appelant l'exécutera en arrière-plan.
+        return {"source_count": len(current), "indexed_sources": 0, "deleted_sources": 0, "deferred_sources": total}
     processed = 0
     if progress_callback:
         progress_callback({
@@ -314,6 +397,64 @@ def sync_documents(
         raise RAGError(f"Échec de la synchronisation RAG : {exc}") from exc
 
 
+def qdrant_status() -> dict:
+    """Disponibilité de Qdrant et existence de la collection du modèle d'embedding actif."""
+    base = settings.rag_qdrant_url.rstrip("/")
+    try:
+        httpx.get(f"{base}/healthz", timeout=3).raise_for_status()
+        response = httpx.get(f"{base}/collections/{collection_name()}", timeout=5)
+        exists = response.status_code == 200
+        if not exists and response.status_code != 404:
+            response.raise_for_status()
+        return {"status": "healthy", "error": "", "collection": collection_name(), "collection_exists": exists}
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        return {"status": "down", "error": str(exc), "collection": collection_name(), "collection_exists": False}
+
+
+def embedding_status() -> dict:
+    """État de l'instance Ollama d'embeddings et des modèles proposés."""
+    try:
+        available = installed_ollama_models()
+        error = ""
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        available = set()
+        error = str(exc)
+    active = embedding_model()
+    ready = model_installed(active, available)
+    options = [
+        {
+            "id": model_id,
+            "label": details["label"],
+            "dimension": details["dimension"],
+            "installed": model_installed(model_id, available),
+            "selected": model_id == active,
+            "selectable": True,
+        }
+        for model_id, details in EMBEDDING_MODELS.items()
+    ]
+    if active not in EMBEDDING_MODELS:
+        # Modèle imposé par l'environnement : affiché mais non sélectionnable.
+        options.insert(0, {
+            "id": active,
+            "label": f"{active} (configuration serveur)",
+            "dimension": embedding_dimension(),
+            "installed": ready,
+            "selected": True,
+            "selectable": False,
+        })
+    return {
+        "status": "healthy" if ready else ("down" if error else "warning"),
+        "error": error,
+        "base_url": embedding_base_url(),
+        "dedicated_instance": embedding_base_url() != settings.ollama_base_url.rstrip("/"),
+        "model": active,
+        "dimension": embedding_dimension(),
+        "collection": collection_name(),
+        "installed_models": sorted(available),
+        "options": options,
+    }
+
+
 def inspect_index() -> dict:
     root = Path(settings.rag_documents_dir).resolve()
     if not root.is_dir():
@@ -334,7 +475,7 @@ def inspect_index() -> dict:
         health_response = httpx.get(f"{settings.rag_qdrant_url.rstrip('/')}/healthz", timeout=3)
         health_response.raise_for_status()
         collection_response = httpx.get(
-            f"{settings.rag_qdrant_url.rstrip('/')}/collections/{settings.rag_collection}",
+            f"{settings.rag_qdrant_url.rstrip('/')}/collections/{collection_name()}",
             timeout=5,
         )
         collection_exists = collection_response.status_code == 200
@@ -386,36 +527,20 @@ def inspect_index() -> dict:
         })
     deleted_sources = sorted(indexed.keys() - current.keys())
 
-    try:
-        embedding_response = httpx.get(
-            f"{settings.ollama_base_url.rstrip('/')}/api/tags",
-            timeout=3,
-        )
-        embedding_response.raise_for_status()
-        available_models = {
-            item.get("name", "").split(":")[0]
-            for item in embedding_response.json().get("models", [])
-        }
-        embedding_ready = settings.ollama_embedding_model.split(":")[0] in available_models
-        embedding_error = ""
-    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-        embedding_ready = False
-        embedding_error = str(exc)
+    embedding = embedding_status()
 
     stale_count = sum(document["status"] in {"pending", "modified"} for document in documents)
     return {
-        "collection": settings.rag_collection,
-        "embedding_model": settings.ollama_embedding_model,
-        "embedding_dimension": settings.rag_embedding_dimension,
+        "collection": collection_name(),
+        "embedding_model": embedding_model(),
+        "embedding_dimension": embedding_dimension(),
         "qdrant": {
             "status": "healthy" if not qdrant_error else "down",
             "error": qdrant_error,
             "collection_exists": collection_exists,
         },
-        "embedding": {
-            "status": "healthy" if embedding_ready else ("down" if embedding_error else "warning"),
-            "error": embedding_error,
-        },
+        "embedding": {"status": embedding["status"], "error": embedding["error"]},
+        "embedding_options": embedding["options"],
         "metrics": {
             "source_count": len(current),
             "indexed_sources": sum(document["status"] in {"indexed", "empty"} for document in documents),
@@ -434,21 +559,21 @@ def evaluate_query(query: str) -> dict:
         if not query.strip():
             raise RAGError("La requête de test ne peut pas être vide.")
         collection_response = httpx.get(
-            f"{settings.rag_qdrant_url.rstrip('/')}/collections/{settings.rag_collection}",
+            f"{settings.rag_qdrant_url.rstrip('/')}/collections/{collection_name()}",
             timeout=10,
         )
         collection_response.raise_for_status()
         collection = collection_response.json()["result"]
         configured_size = collection["config"]["params"]["vectors"]["size"]
-        if configured_size != settings.rag_embedding_dimension:
+        if configured_size != embedding_dimension():
             raise RAGError(
                 f"La collection Qdrant utilise {configured_size} dimensions, "
-                f"mais RAG_EMBEDDING_DIMENSION vaut {settings.rag_embedding_dimension}."
+                f"mais RAG_EMBEDDING_DIMENSION vaut {embedding_dimension()}."
             )
         query_vector = _embed([query])[0]
         matches = _qdrant_request(
             "POST",
-            f"/collections/{settings.rag_collection}/points/search",
+            f"/collections/{collection_name()}/points/search",
             json={
                 "vector": query_vector,
                 "limit": settings.rag_top_k,
@@ -476,11 +601,49 @@ def evaluate_query(query: str) -> dict:
     }
 
 
+def _start_background_sync() -> None:
+    """Lance (une seule fois à la fois) la synchronisation complète du corpus hors du parcours utilisateur."""
+    global _background_sync_active
+    with _background_sync_guard:
+        if _background_sync_active:
+            return
+        _background_sync_active = True
+
+    def work() -> None:
+        global _background_sync_active
+        try:
+            logger.warning("RAG: indexation du corpus en arrière-plan (la recherche utilise l'index partiel)")
+            sync_documents()
+        except RAGError as exc:
+            logger.warning("RAG background sync failed: %s", exc)
+        finally:
+            with _background_sync_guard:
+                _background_sync_active = False
+
+    threading.Thread(target=work, name="rag-background-sync", daemon=True).start()
+
+
+def _sync_before_search() -> None:
+    """Met l'index à jour sans jamais faire attendre l'utilisateur sur une réindexation volumineuse.
+
+    - une indexation est déjà en cours (admin, autre ticket) : on cherche dans l'index actuel;
+    - peu de changements : synchronisation immédiate (nouveau document ajouté à l'instant);
+    - beaucoup de changements (nouveau modèle d'embedding, gros dépôt) : arrière-plan.
+    """
+    if not _sync_lock.acquire(blocking=False):
+        return
+    try:
+        _ensure_collection()
+        result = _sync_documents(max_sources=_INLINE_SYNC_MAX_SOURCES)
+    finally:
+        _sync_lock.release()
+    if result and result.get("deferred_sources"):
+        _start_background_sync()
+
+
 def retrieve_context(query: str) -> str:
     try:
-        with _sync_lock:
-            _ensure_collection()
-            _sync_documents()
+        _sync_before_search()
         if not query.strip():
             return "Aucun extrait documentaire pertinent n'a été fourni."
         evaluation = evaluate_query(query)
@@ -493,4 +656,32 @@ def retrieve_context(query: str) -> str:
         page = match["page"]
         reference = f"{source}, page {page}" if page else source
         excerpts.append(f"[Source : {reference}]\n{match['text']}")
+    # Documents propres à l'entreprise en premier (les plus spécifiques), puis corpus commun et KB constructeur.
+    excerpts = _company_excerpts(query) + excerpts
+    excerpts.extend(_kb_excerpts(query))
     return "\n\n".join(excerpts) or "Aucun extrait documentaire pertinent n'a été trouvé."
+
+
+def _company_excerpts(query: str) -> list[str]:
+    """Extraits privés de l'entreprise courante; [] sans entreprise, sans document ou en cas de panne."""
+    company_id = _company_scope.get()
+    if not company_id:
+        return []
+    try:
+        from app.company_docs import company_excerpts
+
+        return company_excerpts(query, company_id)
+    except Exception:
+        logger.debug("Company excerpts unavailable", exc_info=True)
+        return []
+
+
+def _kb_excerpts(query: str) -> list[str]:
+    """Extraits de la KB constructeur (index séparé); toujours [] si le module est désactivé ou en panne."""
+    try:
+        from app.kb.retrieval import kb_excerpts
+
+        return kb_excerpts(query)
+    except Exception:
+        logger.debug("KB excerpts unavailable", exc_info=True)
+        return []

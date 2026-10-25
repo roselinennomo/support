@@ -201,7 +201,7 @@ def test_admin_ai_diagnostics_show_provider_routes_and_ticket_failures(observabi
     monkeypatch.setattr(
         ai,
         "_call_ollama",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("timed out")),
+        lambda *_args, **_options: (_ for _ in ()).throw(RuntimeError("timed out")),
     )
     with testing_session() as db:
         ticket = db.get(Ticket, ids["ticket"])

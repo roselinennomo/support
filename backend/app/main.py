@@ -18,17 +18,38 @@ from app.ai_routing import (
     AIRoutingUpdate,
     get_routing_config,
     provider_catalog,
+    reset_routing_config,
     save_routing_config,
+    user_ai_options,
 )
 from app.ai_observability import router as ai_observability_router
+from app.kb import flags as kb_flags
+from app.company_docs import router as company_docs_router, start_background_indexing as start_company_docs_indexing
+from app.help_console import recover_interrupted_answers, router as help_router
+from app.kb.archive import restore_on_startup as restore_kb_archive
+from app.kb.jobs import enqueue_reindex, get_queue, recover_interrupted_jobs
+from app.kb.router import router as kb_router, supervision_entry as kb_supervision_entry
 from app.ai_observability import purge_expired_trace_content
-from app.auth import require_roles, router as auth_router
+from app.auth import get_current_user, require_roles, router as auth_router
 from app.config import settings
 from app.database import Base, SessionLocal, engine, get_db
-from app.models import Company, Ticket, User, company_agents
-from app.rag import RAGError, evaluate_query, inspect_index, sync_documents
+from app.models import AIExecution, Company, RAGConfig, Ticket, TicketEvent, User, company_agents
+from app.rag import (
+    EMBEDDING_MODELS,
+    RAGError,
+    delete_sources,
+    embedding_model,
+    embedding_status,
+    evaluate_query,
+    inspect_index,
+    installed_ollama_models,
+    model_installed,
+    qdrant_status,
+    set_embedding_model,
+    sync_documents,
+)
 from app.security import hash_password
-from app.tickets import router as tickets_router
+from app.tickets import recover_stuck_ai_tickets, router as tickets_router
 from app.users import router as users_router
 from app.service_management import router as service_management_router
 
@@ -95,10 +116,58 @@ def _ensure_ticket_lifecycle_columns() -> None:
                 connection.execute(
                     text(f"ALTER TABLE tickets ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
                 )
+        if "ai_preferences" not in columns:
+            connection.execute(text("ALTER TABLE tickets ADD COLUMN ai_preferences JSON"))
         connection.execute(text(
             "UPDATE tickets SET resolution_note = ai_summary "
             "WHERE status = 'resolved' AND resolution_note = '' AND trim(ai_summary) != ''"
         ))
+
+
+def _ensure_ai_execution_nullable_ticket() -> None:
+    """La console d'aide mesure des appels IA sans ticket : ai_executions.ticket_id devient facultatif."""
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE ai_executions ALTER COLUMN ticket_id DROP NOT NULL"))
+
+
+def _ensure_individual_company_column() -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("companies")}
+    if "is_individual" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE companies ADD COLUMN is_individual BOOLEAN NOT NULL DEFAULT FALSE"))
+
+
+def _ensure_help_columns() -> None:
+    inspector = inspect(engine)
+    additions = {
+        "help_messages": {"thinking": "TEXT NOT NULL DEFAULT ''", "completed_at": "TIMESTAMP WITH TIME ZONE"},
+        "help_files": {"origin": "VARCHAR(10) NOT NULL DEFAULT 'upload'"},
+    }
+    with engine.begin() as connection:
+        for table, columns in additions.items():
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, definition in columns.items():
+                if name not in existing:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
+
+
+def _ensure_kb_columns() -> None:
+    """Colonnes ajoutées aux tables KB après leur création (déploiements existants)."""
+    inspector = inspect(engine)
+    additions = {
+        "kb_articles": {"source": "VARCHAR(20) NOT NULL DEFAULT 'kb'"},
+        "kb_jobs": {"results": "JSON"},
+    }
+    with engine.begin() as connection:
+        for table, columns in additions.items():
+            if not inspector.has_table(table):
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, column_type in columns.items():
+                if name not in existing:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}"))
 
 
 def _ensure_service_management_columns() -> None:
@@ -152,6 +221,10 @@ async def lifespan(_app: FastAPI):
     _ensure_ai_consent_columns()
     _ensure_ticket_lifecycle_columns()
     _ensure_service_management_columns()
+    _ensure_ai_execution_nullable_ticket()
+    _ensure_help_columns()
+    _ensure_individual_company_column()
+    _ensure_kb_columns()
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
     with SessionLocal() as db:
         email = settings.initial_admin_email.lower()
@@ -163,10 +236,19 @@ async def lifespan(_app: FastAPI):
                 password_hash=hash_password(settings.initial_admin_password),
             ))
             db.commit()
+        rag_config = db.get(RAGConfig, 1)
+        if rag_config and rag_config.embedding_model in EMBEDDING_MODELS:
+            set_embedding_model(rag_config.embedding_model)
+    recover_interrupted_jobs(SessionLocal)
+    restore_kb_archive(SessionLocal)
+    start_company_docs_indexing()
+    recover_interrupted_answers()
+    recover_stuck_ai_tickets()
     purge_task = asyncio.create_task(_purge_expired_ai_traces())
     try:
         yield
     finally:
+        get_queue().stop()
         purge_task.cancel()
         try:
             await purge_task
@@ -191,11 +273,22 @@ app.include_router(auth_router)
 app.include_router(tickets_router)
 app.include_router(users_router)
 app.include_router(ai_observability_router)
+app.include_router(kb_router)
+app.include_router(company_docs_router)
+app.include_router(help_router)
 app.include_router(service_management_router)
 
 
 class RAGQuery(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
+
+
+class RAGEmbeddingUpdate(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
+
+
+class RAGDocumentsDelete(BaseModel):
+    names: list[str] = Field(min_length=1, max_length=200)
 
 
 @app.get("/api/admin/ai-routing", tags=["ai"])
@@ -221,6 +314,32 @@ def update_ai_routing(
         return save_routing_config(db, payload)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/api/admin/ai-routing", tags=["ai"])
+def reset_ai_routing(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
+):
+    """Rétablit la configuration par défaut issue de l'environnement (modèle, think, délai)."""
+    return {
+        **reset_routing_config(db),
+        "tasks": AI_TASKS,
+        "roles": AI_ROLES,
+        "providers": provider_catalog(),
+    }
+
+
+@app.get("/api/ai/options", tags=["ai"])
+def get_ai_options(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Modèles que l'utilisateur courant peut choisir, d'après les affectations de l'administrateur."""
+    options = user_ai_options(db, user.role)
+    if user.role != "customer":
+        options["kb_enabled"] = kb_flags.is_enabled()
+    return options
 
 
 def _run_rag_indexing() -> None:
@@ -294,8 +413,8 @@ def rag_admin_status(_admin: User = Depends(require_roles("admin"))):
     except RAGError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     overview["limits"] = {
-        "max_file_size": settings.max_attachment_size,
-        "max_files": settings.max_attachments_per_upload,
+        "max_file_size": settings.rag_max_file_size,
+        "max_files": settings.rag_max_files_per_upload,
     }
     with _rag_index_lock:
         overview["indexing"] = dict(_rag_index_job)
@@ -323,10 +442,10 @@ def upload_rag_documents(
 ):
     if not files:
         raise HTTPException(status_code=422, detail="Sélectionnez au moins un document.")
-    if len(files) > settings.max_attachments_per_upload:
+    if len(files) > settings.rag_max_files_per_upload:
         raise HTTPException(
             status_code=413,
-            detail=f"Vous pouvez ajouter au maximum {settings.max_attachments_per_upload} documents par envoi.",
+            detail=f"Vous pouvez ajouter au maximum {settings.rag_max_files_per_upload} documents par envoi.",
         )
 
     root = Path(settings.rag_documents_dir).resolve()
@@ -336,7 +455,7 @@ def upload_rag_documents(
         for path in root.rglob("*")
         if path.is_file()
     }
-    uploads = []
+    uploads: list[tuple[str, UploadFile]] = []
     requested_names = set()
     for upload in files:
         filename = Path(upload.filename or "").name
@@ -348,30 +467,33 @@ def upload_rag_documents(
             )
         if filename in existing_names or filename in requested_names:
             raise HTTPException(status_code=409, detail=f"Un document nommé {filename} existe déjà.")
-        content = upload.file.read(settings.max_attachment_size + 1)
-        if len(content) > settings.max_attachment_size:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Le document {filename} dépasse la limite de {settings.max_attachment_size} octets.",
-            )
         requested_names.add(filename)
-        uploads.append((filename, content))
+        uploads.append((filename, upload))
 
+    # Écriture par blocs : évite de charger jusqu'à 50 fichiers de 50 Mo en mémoire.
     created_paths = []
     try:
-        for filename, content in uploads:
+        for filename, upload in uploads:
             destination = (root / filename).resolve()
             if destination.parent != root:
                 raise HTTPException(status_code=400, detail="Nom de document invalide.")
             try:
                 with destination.open("xb") as destination_file:
-                    destination_file.write(content)
+                    created_paths.append(destination)
+                    written = 0
+                    while chunk := upload.file.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > settings.rag_max_file_size:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"Le document {filename} dépasse la limite de {settings.rag_max_file_size} octets.",
+                            )
+                        destination_file.write(chunk)
             except FileExistsError as exc:
                 raise HTTPException(
                     status_code=409,
                     detail=f"Un document nommé {filename} existe déjà.",
                 ) from exc
-            created_paths.append(destination)
     except Exception:
         for path in created_paths:
             path.unlink(missing_ok=True)
@@ -379,11 +501,13 @@ def upload_rag_documents(
     return {"uploaded": [filename for filename, _ in uploads], "indexing_required": True}
 
 
-@app.post("/api/admin/rag/index", tags=["rag"], status_code=202)
-def start_rag_indexing(
-    background_tasks: BackgroundTasks,
-    _admin: User = Depends(require_roles("admin")),
-):
+def _ensure_no_rag_indexing() -> None:
+    with _rag_index_lock:
+        if _rag_index_job["status"] in {"pending", "running"}:
+            raise HTTPException(status_code=409, detail="Une indexation RAG est déjà en cours.")
+
+
+def _mark_rag_indexing_pending() -> None:
     with _rag_index_lock:
         if _rag_index_job["status"] in {"pending", "running"}:
             raise HTTPException(status_code=409, detail="Une indexation RAG est déjà en cours.")
@@ -401,8 +525,114 @@ def start_rag_indexing(
                 "message": "Indexation en attente…",
             },
         })
+
+
+@app.post("/api/admin/rag/index", tags=["rag"], status_code=202)
+def start_rag_indexing(
+    background_tasks: BackgroundTasks,
+    _admin: User = Depends(require_roles("admin")),
+):
+    _mark_rag_indexing_pending()
     background_tasks.add_task(_run_rag_indexing)
     return {"status": "pending"}
+
+
+@app.put("/api/admin/rag/embedding-model", tags=["rag"], status_code=202)
+def update_rag_embedding_model(
+    payload: RAGEmbeddingUpdate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
+):
+    """Change le modèle d'embedding et réindexe le corpus dans la collection de ce modèle."""
+    model = payload.model.strip()
+    if model not in EMBEDDING_MODELS:
+        raise HTTPException(status_code=422, detail="Modèle d'embedding non pris en charge.")
+    if model == embedding_model():
+        return {"embedding_model": model, "indexing": "unchanged"}
+    try:
+        installed = installed_ollama_models()
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=503, detail=f"Ollama est indisponible : {exc}") from exc
+    if not model_installed(model, installed):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Le modèle {model} n'est pas téléchargé dans Ollama. "
+                f"Téléchargez-le (docker compose exec ollama-embed ollama pull {model}) puis réessayez."
+            ),
+        )
+    _mark_rag_indexing_pending()
+    record = db.get(RAGConfig, 1)
+    if record:
+        record.embedding_model = model
+    else:
+        db.add(RAGConfig(id=1, embedding_model=model))
+    db.commit()
+    set_embedding_model(model)
+    background_tasks.add_task(_run_rag_indexing)
+    background_tasks.add_task(enqueue_reindex)  # articles KB déjà récupérés, sans re-scraper
+    background_tasks.add_task(start_company_docs_indexing)  # documents privés des entreprises
+    return {"embedding_model": model, "indexing": "pending"}
+
+
+@app.delete("/api/admin/rag/documents", tags=["rag"])
+def delete_rag_documents(
+    payload: RAGDocumentsDelete,
+    _admin: User = Depends(require_roles("admin")),
+):
+    """Supprime des documents du corpus (fichier source et vecteurs de la collection active)."""
+    _ensure_no_rag_indexing()
+    root = Path(settings.rag_documents_dir).resolve()
+    targets: list[tuple[str, Path]] = []
+    for name in dict.fromkeys(payload.names):
+        path = (root / name).resolve()
+        if (
+            root not in path.parents
+            or not path.is_file()
+            or path.suffix.lower() not in _RAG_DOCUMENT_EXTENSIONS
+        ):
+            raise HTTPException(status_code=404, detail=f"Document introuvable : {name}")
+        targets.append((path.relative_to(root).as_posix(), path))
+
+    for _source, path in targets:
+        path.unlink()
+    sources = [source for source, _path in targets]
+    try:
+        delete_sources(sources)
+        index_updated = True
+    except RAGError as exc:
+        # Les fichiers sont supprimés : la prochaine synchronisation retirera les vecteurs restants.
+        logger.warning("RAG documents deleted but index cleanup failed: %s", exc)
+        index_updated = False
+    return {"deleted": sources, "index_updated": index_updated}
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _anthropic_health(db: Session) -> tuple[str, str]:
+    """État d'Anthropic déduit des appels réels (aucun appel facturable n'est émis par la supervision)."""
+    last_ok = db.scalar(
+        select(AIExecution).where(AIExecution.provider == "anthropic").order_by(AIExecution.created_at.desc()).limit(1)
+    )
+    failure = None
+    for event in db.scalars(
+        select(TicketEvent).where(TicketEvent.event_type == "ai_provider_failed").order_by(TicketEvent.created_at.desc()).limit(50)
+    ):
+        if (event.details or {}).get("provider") == "anthropic":
+            failure = event
+            break
+    if failure and (not last_ok or _as_utc(failure.created_at) > _as_utc(last_ok.created_at)):
+        error = str((failure.details or {}).get("error", ""))[:200]
+        return "warning", f"Le dernier appel Anthropic a échoué le {_as_utc(failure.created_at):%d/%m/%Y à %H:%M} UTC : {error}"
+    if last_ok:
+        return "healthy", (
+            f"Dernier appel réussi le {_as_utc(last_ok.created_at):%d/%m/%Y à %H:%M} UTC "
+            f"(modèle {last_ok.model}, {last_ok.duration_ms / 1000:.1f} s)."
+        )
+    return "warning", "Clé configurée; aucun appel Anthropic effectué pour l’instant (la connectivité sera confirmée au premier appel)."
 
 
 @app.get("/api/system/overview", tags=["system"])
@@ -430,76 +660,65 @@ def system_overview(db: Session = Depends(get_db), _admin: User = Depends(requir
         for model in route["models"]
     }
 
+    # Instance Ollama de génération (chat); les embeddings RAG ont leur propre instance.
     ollama_status = "disabled"
-    ollama_detail = "Ollama est utilisé pour les embeddings documentaires RAG."
+    ollama_detail = "Ollama n’est pas affecté à une règle IA active."
     try:
         response = httpx.get(f"{settings.ollama_base_url.rstrip('/')}/api/tags", timeout=3.0)
         response.raise_for_status()
         models = response.json().get("models") or []
-        embedding_model_present = any(
-            model.get("name", "").split(":")[0] == settings.ollama_embedding_model.split(":")[0]
-            for model in models
-        )
         if not models:
             ollama_status = "warning"
             ollama_detail = "Ollama répond mais aucun modèle n’est encore disponible."
-        elif not embedding_model_present:
-            ollama_status = "warning"
-            ollama_detail = (
-                f"Ollama est disponible, mais l’embedding RAG {settings.ollama_embedding_model} "
-                "n’est pas téléchargé."
-            )
         else:
             ollama_status = "healthy"
-            generation_note = " et le routage IA" if "ollama" in active_providers else ""
-            ollama_detail = (
-                f"Ollama disponible avec {len(models)} modèle(s); embeddings RAG{generation_note}."
-            )
+            usage_note = "utilisé par le routage IA" if "ollama" in active_providers else "non affecté au routage IA"
+            ollama_detail = f"Ollama (génération) disponible avec {len(models)} modèle(s); {usage_note}."
     except Exception as exc:  # pragma: no cover - defensive branch
         ollama_status = "down"
         ollama_detail = f"Ollama indisponible : {exc}"
 
     if "anthropic" in active_providers:
-        anthropic_status = "warning" if settings.anthropic_api_key else "down"
-        anthropic_detail = (
-            "Clé configurée; la connectivité sera confirmée lors d’un appel."
-            if settings.anthropic_api_key
-            else "Une règle utilise Anthropic mais ANTHROPIC_API_KEY n’est pas configurée."
-        )
+        if settings.anthropic_api_key:
+            anthropic_status, anthropic_detail = _anthropic_health(db)
+        else:
+            anthropic_status = "down"
+            anthropic_detail = "Une règle utilise Anthropic mais ANTHROPIC_API_KEY n’est pas configurée."
     else:
         anthropic_status = "disabled"
         anthropic_detail = "Anthropic n’est pas affecté à une règle IA active."
 
-    try:
-        qdrant_response = httpx.get(f"{settings.rag_qdrant_url.rstrip('/')}/healthz", timeout=3.0)
-        qdrant_response.raise_for_status()
-        embedding_response = httpx.get(
-            f"{settings.ollama_base_url.rstrip('/')}/api/tags",
-            timeout=3.0,
+    # Instance Ollama d'embeddings : service distinct de l'Ollama de génération.
+    embedding = embedding_status()
+    embedding_service_status = embedding["status"]
+    if embedding["status"] == "healthy":
+        scope = "instance dédiée" if embedding["dedicated_instance"] else "instance partagée avec la génération"
+        embedding_service_detail = (
+            f"Ollama (embeddings) disponible, {scope}; modèle actif {embedding['model']} "
+            f"({embedding['dimension']} dimensions)."
         )
-        embedding_response.raise_for_status()
-        models = embedding_response.json().get("models") or []
-        embedding_model_present = any(
-            model.get("name", "").split(":")[0] == settings.ollama_embedding_model.split(":")[0]
-            for model in models
+    elif embedding["status"] == "warning":
+        embedding_service_detail = (
+            f"Instance d'embeddings joignable, mais le modèle actif {embedding['model']} "
+            "n'est pas téléchargé."
         )
-        if embedding_model_present:
-            rag_status = "healthy"
-            rag_detail = "Qdrant et le modèle d'embedding Ollama sont disponibles."
-        else:
-            rag_status = "warning"
-            rag_detail = (
-                f"Qdrant est disponible, mais le modèle d'embedding "
-                f"{settings.ollama_embedding_model} n'est pas encore téléchargé."
-            )
-    except Exception as exc:  # pragma: no cover - defensive branch
+    else:
+        embedding_service_detail = f"Ollama (embeddings) indisponible : {embedding['error']}"
+
+    qdrant = qdrant_status()
+    if qdrant["status"] == "healthy":
+        rag_status = "healthy"
+        rag_detail = (
+            f"Qdrant disponible; collection {qdrant['collection']} "
+            + ("présente." if qdrant["collection_exists"] else "à créer (lancer l'indexation du corpus).")
+        )
+    else:
         rag_status = "down"
-        rag_detail = f"Service RAG indisponible : {exc}"
+        rag_detail = f"Qdrant indisponible : {qdrant['error']}"
 
     open_tickets = db.scalar(
         select(func.count()).select_from(Ticket).where(Ticket.status.notin_(["resolved", "closed", "rejected"]))
     ) or 0
-    escalated_tickets = db.scalar(select(func.count()).select_from(Ticket).where(Ticket.status == "escalated")) or 0
     staff_count = db.scalar(select(func.count()).select_from(User).where(User.role.in_(["agent", "admin"]))) or 0
     customer_count = db.scalar(select(func.count()).select_from(User).where(User.role == "customer")) or 0
     queue_status = "healthy"
@@ -511,13 +730,16 @@ def system_overview(db: Session = Depends(get_db), _admin: User = Depends(requir
         queue_status = "down"
         queue_detail = f"{open_tickets} incidents ouverts : saturation probable de la file de support."
 
+    kb_service = kb_supervision_entry(db)
     services = [
         _service("database", database_status, database_detail),
         _service("api", api_status, api_detail),
         _service("ollama", ollama_status, ollama_detail),
+        _service("embedding", embedding_service_status, embedding_service_detail),
         _service("anthropic", anthropic_status, anthropic_detail),
         _service("rag", rag_status, rag_detail),
         _service("queue", queue_status, queue_detail),
+        *([kb_service] if kb_service else []),
     ]
     overall_status = "ok" if all(service["status"] in {"healthy", "warning", "disabled"} for service in services) else "degraded"
     return {
@@ -525,7 +747,6 @@ def system_overview(db: Session = Depends(get_db), _admin: User = Depends(requir
         "services": services,
         "metrics": {
             "open_tickets": open_tickets,
-            "escalated_tickets": escalated_tickets,
             "staff_count": staff_count,
             "customer_count": customer_count,
         },

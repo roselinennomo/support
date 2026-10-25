@@ -1,7 +1,9 @@
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, ValidationError, model_validator
+
+from app.ai_routing import ModelSelection
 
 _EMAIL_STR_ADAPTER = TypeAdapter(EmailStr)
 
@@ -32,9 +34,17 @@ class UserCreate(BaseModel):
     email: PortalEmail
     full_name: str = Field(min_length=2, max_length=120)
     password: str = Field(min_length=10, max_length=128)
-    company_code: str = Field(min_length=8, max_length=100)
+    company_code: str = Field(default="", max_length=100)
+    # « independent » : client sans entreprise, rattaché à une entreprise individuelle créée à l'inscription.
+    account_type: Literal["company", "independent"] = "company"
     ai_processing_consent: bool = True
     ai_trace_consent: bool = True
+
+    @model_validator(mode="after")
+    def _company_code_required(self):
+        if self.account_type == "company" and len(self.company_code) < 8:
+            raise ValueError("Le code d’entreprise est obligatoire (8 caractères minimum).")
+        return self
 
 
 class StaffUserCreate(BaseModel):
@@ -87,6 +97,7 @@ class UserOut(BaseModel):
     is_active: bool
     company_id: str | None = None
     company_name: str | None = None
+    is_individual: bool = False
     company_ids: list[str] = Field(default_factory=list)
     account_status: str = "approved"
     created_at: datetime | None = None
@@ -109,6 +120,7 @@ class CompanyOut(BaseModel):
     id: str
     name: str
     is_active: bool
+    is_individual: bool = False
     agent_ids: list[str]
     created_at: datetime
 
@@ -129,6 +141,7 @@ class TokenResponse(BaseModel):
 
 
 class TicketCreate(BaseModel):
+    ai_model: ModelSelection | None = None
     title: str = Field(min_length=5, max_length=180)
     description: str = Field(min_length=20, max_length=10000)
     product: str = Field(default="OXE", min_length=2, max_length=100)
@@ -143,15 +156,9 @@ class MessageCreate(BaseModel):
 
 
 class StatusUpdate(BaseModel):
-    status: str = Field(pattern="^(new|in_progress|waiting_support|waiting_customer|escalated|resolved|rejected)$")
+    status: str = Field(pattern="^(new|in_progress|waiting_support|waiting_customer|resolved|rejected)$")
     resolution_note: str = Field(default="", max_length=5000)
     rejection_reason: str = Field(default="", max_length=5000)
-
-
-class EscalationCreate(BaseModel):
-    team: str = Field(min_length=2, max_length=120)
-    reason: str = Field(min_length=5, max_length=5000)
-    external_reference: str = Field(default="", max_length=120)
 
 
 class AssignmentUpdate(BaseModel):
@@ -221,6 +228,7 @@ class TicketOut(BaseModel):
     ai_recommendations: list[str]
     ai_escalation_recommended: bool
     ai_error: str
+    ai_preferences: dict | None = None
     resolution_note: str
     rejection_reason: str
     escalation_team: str
@@ -234,4 +242,13 @@ class TicketOut(BaseModel):
 
 
 class AgentAIAssist(BaseModel):
-    question: str = Field(min_length=3, max_length=2000)
+    # "summary" produit le résumé du ticket (tâche handoff_summary) sans question libre.
+    kind: Literal["question", "summary"] = "question"
+    question: str = Field(default="", max_length=2000)
+    ai_model: ModelSelection | None = None
+
+    @model_validator(mode="after")
+    def require_question_when_asking(self):
+        if self.kind == "question" and len(self.question.strip()) < 3:
+            raise ValueError("La question doit contenir au moins 3 caractères.")
+        return self

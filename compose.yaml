@@ -26,24 +26,102 @@ services:
       start_period: 20s
     restart: unless-stopped
 
+  # Instance dédiée aux embeddings RAG : l'indexation d'un gros corpus n'entre pas en concurrence avec
+  # le chat et les modèles ne s'évincent pas mutuellement de la mémoire.
+  ollama-embed:
+    image: ollama/ollama:latest
+    # Plafond de CPU : sans lui, l'indexation du corpus accapare tous les cœurs et le chat
+    # (réponses IA aux clients) expire. Réglable selon la machine (OLLAMA_EMBED_CPUS).
+    cpus: ${OLLAMA_EMBED_CPUS:-3}
+    environment:
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "2"  # une recherche peut s'exécuter pendant qu'un lot d'indexation tourne
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_EMBEDDING_KEEP_ALIVE:-30m}
+    volumes:
+      - ollama-embed-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "ps"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
   ollama-model:
     image: ollama/ollama:latest
     depends_on:
       ollama:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
-    command: ["ollama pull \"$${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}\" && if [ \"$${AI_PROVIDER:-ollama}\" = \"ollama\" ]; then ollama pull \"$${OLLAMA_MODEL:-qwen3:4b}\"; else echo \"Ollama chat model download skipped for AI_PROVIDER=$${AI_PROVIDER}\"; fi"]
+    command: ["if [ \"$${AI_PROVIDER:-ollama}\" = \"ollama\" ]; then ollama pull \"$${OLLAMA_MODEL:-deepseek-r1:1.5b}\" && for extra in $${OLLAMA_EXTRA_MODELS:-}; do ollama pull \"$$extra\"; done; else echo \"Ollama chat model download skipped for AI_PROVIDER=$${AI_PROVIDER}\"; fi"]
     environment:
       OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
-      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-deepseek-r1:1.5b}
+      OLLAMA_EXTRA_MODELS: ${OLLAMA_EXTRA_MODELS:-qwen3:4b}
       AI_PROVIDER: ${AI_PROVIDER:-ollama}
+    restart: "no"
+
+  # Les embeddings sont nécessaires au RAG quel que soit le fournisseur de chat.
+  ollama-embed-model:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama-embed:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["for model in \"$${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:0.6b}\" $${OLLAMA_EXTRA_EMBEDDING_MODELS:-}; do ollama pull \"$$model\" || exit 1; done"]
+    environment:
+      OLLAMA_HOST: http://ollama-embed:11434
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      OLLAMA_EXTRA_EMBEDDING_MODELS: ${OLLAMA_EXTRA_EMBEDDING_MODELS:-bge-m3 qwen3-embedding:4b}
     restart: "no"
 
   qdrant:
     image: qdrant/qdrant:v1.13.6
     volumes:
       - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+  # Navigateur Chromium (Playwright) pour enrichir l'assistance avec la KB constructeur.
+  # Optionnel : démarre seulement avec `docker compose --profile kb up -d`. L'API n'en dépend pas;
+  # s'il est arrêté, l'assistance IA fonctionne exactement comme avant.
+  kb-browser:
+    profiles: ["kb"]
+    build: ./kb-browser
+    shm_size: "1gb"
+    environment:
+      KB_BASE_URL: ${KB_BASE_URL:-}
+      KB_SEARCH_URL: ${KB_SEARCH_URL:-}
+      KB_BROWSER_TOKEN: ${KB_BROWSER_TOKEN:-}
+      KB_BROWSER_VNC_PASSWORD: ${KB_BROWSER_VNC_PASSWORD:-}
+      KB_BROWSER_HEADLESS: ${KB_BROWSER_HEADLESS:-}
+      KB_SEARCH_INPUT_SELECTOR: ${KB_SEARCH_INPUT_SELECTOR:-}
+      KB_SEARCH_SUBMIT_SELECTOR: ${KB_SEARCH_SUBMIT_SELECTOR:-}
+      KB_RESULT_LINK_SELECTOR: ${KB_RESULT_LINK_SELECTOR:-}
+      KB_NO_RESULTS_SELECTOR: ${KB_NO_RESULTS_SELECTOR:-}
+      KB_ARTICLE_SELECTOR: ${KB_ARTICLE_SELECTOR:-}
+      KB_TITLE_SELECTOR: ${KB_TITLE_SELECTOR:-}
+      KB_LOGGED_IN_SELECTOR: ${KB_LOGGED_IN_SELECTOR:-}
+      KB_LOGIN_SELECTOR: ${KB_LOGIN_SELECTOR:-}
+      KB_LOGIN_URL_PATTERNS: ${KB_LOGIN_URL_PATTERNS:-}
+      KB_ALLOWED_HOSTS: ${KB_ALLOWED_HOSTS:-}
+      KB_REQUEST_DELAY_MS: ${KB_REQUEST_DELAY_MS:-}
+      KB_READY_SELECTOR: ${KB_READY_SELECTOR:-}
+      KB_ARTICLE_JOIN: ${KB_ARTICLE_JOIN:-}
+      KB_ARTICLE_FORMAT: ${KB_ARTICLE_FORMAT:-}
+      KB_DOCS_URL: ${KB_DOCS_URL:-}
+      KB_DOCS_SEARCH_INPUT_SELECTOR: ${KB_DOCS_SEARCH_INPUT_SELECTOR:-}
+      KB_DOCS_ROW_LINK_SELECTOR: ${KB_DOCS_ROW_LINK_SELECTOR:-}
+      KB_DOCS_DOWNLOAD_SELECTOR: ${KB_DOCS_DOWNLOAD_SELECTOR:-}
+      KB_DOCS_START_MARKER: ${KB_DOCS_START_MARKER:-}
+      KB_DOCS_END_MARKER: ${KB_DOCS_END_MARKER:-}
+      KB_DOCS_MAX_FILE_MB: ${KB_DOCS_MAX_FILE_MB:-}
+      KB_SETTLE_MS: ${KB_SETTLE_MS:-}
+      KB_RESULTS_REFRESH_MS: ${KB_RESULTS_REFRESH_MS:-}
+    volumes:
+      - kb-browser-profile:/data/profile
+    ports:
+      # noVNC (connexion/MFA manuelle) : limité à la machine locale et protégé par mot de passe.
+      - "127.0.0.1:6080:6080"
     restart: unless-stopped
 
   api:
@@ -54,20 +132,50 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://support:support@db:5432/support}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
-      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-deepseek-r1:1.5b}
+      OLLAMA_EMBEDDING_BASE_URL: ${OLLAMA_EMBEDDING_BASE_URL:-http://ollama-embed:11434}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      OLLAMA_EXTRA_MODELS: ${OLLAMA_EXTRA_MODELS:-qwen3:4b}
+      OLLAMA_THINK: ${OLLAMA_THINK:-true}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-300}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-8192}
       RAG_DOCUMENTS_DIR: /app/support_docs
       RAG_QDRANT_URL: http://qdrant:6333
       RAG_COLLECTION: ${RAG_COLLECTION:-support_documents}
-      RAG_EMBEDDING_DIMENSION: ${RAG_EMBEDDING_DIMENSION:-768}
+      RAG_EMBEDDING_DIMENSION: ${RAG_EMBEDDING_DIMENSION:-1024}
       RAG_TOP_K: ${RAG_TOP_K:-5}
       RAG_SCORE_THRESHOLD: ${RAG_SCORE_THRESHOLD:-0.35}
       UPLOAD_DIR: /app/uploads
       MAX_ATTACHMENT_SIZE: ${MAX_ATTACHMENT_SIZE:-10485760}
       MAX_ATTACHMENTS_PER_UPLOAD: ${MAX_ATTACHMENTS_PER_UPLOAD:-5}
+      RAG_MAX_FILE_SIZE: ${RAG_MAX_FILE_SIZE:-52428800}
+      RAG_MAX_FILES_PER_UPLOAD: ${RAG_MAX_FILES_PER_UPLOAD:-50}
+      ENABLE_KB_BROWSER_SCRAPER: ${ENABLE_KB_BROWSER_SCRAPER:-false}
+      KB_BROWSER_URL: ${KB_BROWSER_URL:-http://kb-browser:8090}
+      KB_BROWSER_TOKEN: ${KB_BROWSER_TOKEN:-}
+      KB_LOGIN_URL: ${KB_LOGIN_URL:-http://localhost:6080/vnc.html?autoconnect=1&resize=scale}
+      KB_MAX_ARTICLES: ${KB_MAX_ARTICLES:-3}
+      KB_DOCS_MAX_RESULTS: ${KB_DOCS_MAX_RESULTS:-2}
+      KB_DOCS_ENABLED: ${KB_DOCS_ENABLED:-false}
+      KB_ARCHIVE_DIR: /app/kb_archive
+      COMPANY_DOCS_DIR: /app/company_docs
+      COMPANY_DOCS_MAX_FILE_MB: ${COMPANY_DOCS_MAX_FILE_MB:-10}
+      COMPANY_DOCS_MAX_FILES_PER_UPLOAD: ${COMPANY_DOCS_MAX_FILES_PER_UPLOAD:-5}
+      COMPANY_DOCS_MAX_MB_PER_COMPANY: ${COMPANY_DOCS_MAX_MB_PER_COMPANY:-500}
+      WEB_SEARCH_URL: ${WEB_SEARCH_URL:-}
+      WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
+      HELP_HISTORY_MESSAGES: ${HELP_HISTORY_MESSAGES:-12}
+      KB_ARCHIVE_ENABLED: ${KB_ARCHIVE_ENABLED:-true}
+      KB_ARCHIVE_MAX_MB: ${KB_ARCHIVE_MAX_MB:-2048}
+      KB_DOCS_EXCLUDE_TYPES: ${KB_DOCS_EXCLUDE_TYPES:-Price catalog,Pricing,Offer/Proposal,RFP,Quoter,Commercial}
     volumes:
       - support-uploads:/app/uploads
       - ./support_docs:/app/support_docs
+      # Archive locale des éléments KB : dossier du projet, hors volumes Docker (survit à « down -v »).
+      - ./kb_archive:/app/kb_archive
+      # Fichiers originaux des documents d'entreprise : dossier du projet, hors volumes Docker.
+      - ./company_docs:/app/company_docs
     depends_on:
       db:
         condition: service_healthy
@@ -92,5 +200,7 @@ services:
 volumes:
   postgres-data:
   ollama-data:
+  ollama-embed-data:
+  kb-browser-profile:
   qdrant-data:
   support-uploads:
