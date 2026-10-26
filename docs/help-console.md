@@ -22,6 +22,10 @@ Conversation libre avec l'assistant technique, réservée aux **administrateurs*
 
 Chaque appel est enregistré dans `ai_executions` au nom de l'utilisateur avec `ticket_id` vide (colonne désormais facultative, migrée automatiquement). Les écrans « Évaluation LLM » et « Coûts IA » les affichent sous « Console d'aide ». Le contenu (prompt/réponse) n'est conservé que si l'utilisateur a consenti aux traces IA, avec la même rétention que les tickets.
 
+## Diagnostic
+
+Les échecs d'appels IA de la console (par modèle essayé) sont enregistrés dans `ai_failures`. La page **Diagnostic IA** affiche une section « Console d'aide » (appels réussis récents, compteurs sur 24 h) et filtre les « Échecs récents » par origine (tickets / console d'aide) et par utilisateur; l'état des fournisseurs et la supervision en tiennent compte. `GET /api/admin/ai/diagnostics?source=all|ticket|console&user_id=…`.
+
 ## Configuration
 
 | Variable | Rôle |

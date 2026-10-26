@@ -34,6 +34,7 @@ from app.auth import get_current_user, require_roles, router as auth_router
 from app.config import settings
 from app.database import Base, SessionLocal, engine, get_db
 from app.models import AIExecution, Company, RAGConfig, Ticket, TicketEvent, User, company_agents
+import app.rag as rag_module
 from app.rag import (
     EMBEDDING_MODELS,
     RAGError,
@@ -243,6 +244,7 @@ async def lifespan(_app: FastAPI):
     restore_kb_archive(SessionLocal)
     start_company_docs_indexing()
     recover_interrupted_answers()
+    threading.Thread(target=rag_module.resume_pending_sync, name="rag-resume", daemon=True).start()
     recover_stuck_ai_tickets()
     purge_task = asyncio.create_task(_purge_expired_ai_traces())
     try:
@@ -624,6 +626,13 @@ def _anthropic_health(db: Session) -> tuple[str, str]:
         if (event.details or {}).get("provider") == "anthropic":
             failure = event
             break
+    from app.models import AIFailure
+
+    console_failure = db.scalar(
+        select(AIFailure).where(AIFailure.provider == "anthropic").order_by(AIFailure.created_at.desc()).limit(1)
+    )
+    if console_failure and (not failure or _as_utc(console_failure.created_at) > _as_utc(failure.created_at)):
+        failure = type("Failure", (), {"details": {"error": console_failure.error}, "created_at": console_failure.created_at})()
     if failure and (not last_ok or _as_utc(failure.created_at) > _as_utc(last_ok.created_at)):
         error = str((failure.details or {}).get("error", ""))[:200]
         return "warning", f"Le dernier appel Anthropic a échoué le {_as_utc(failure.created_at):%d/%m/%Y à %H:%M} UTC : {error}"

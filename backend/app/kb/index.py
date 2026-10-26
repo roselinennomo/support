@@ -7,6 +7,7 @@ import uuid
 import httpx
 
 from app import rag
+from app.ai_steps import step
 from app.config import settings
 from app.kb.interfaces import KBError
 
@@ -52,7 +53,7 @@ class QdrantKBIndex:
         points = []
         for start in range(0, len(chunks), _BATCH_SIZE):
             batch = chunks[start:start + _BATCH_SIZE]
-            for offset, (chunk, vector) in enumerate(zip(batch, rag._embed(batch), strict=True)):
+            for offset, (chunk, vector) in enumerate(zip(batch, rag._embed_for_index(batch), strict=True)):
                 points.append({
                     "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{url}:{content_hash}:{start + offset}")),
                     "vector": vector,
@@ -90,16 +91,19 @@ class QdrantKBIndex:
     def search(self, query: str, limit: int) -> list[dict]:
         if not self._collection_exists():
             return []
-        matches = rag._qdrant_request(
-            "POST",
-            f"/collections/{collection_name()}/points/search",
-            json={
-                "vector": rag._embed([query])[0],
-                "limit": limit,
-                "with_payload": True,
-                "score_threshold": settings.rag_score_threshold,
-            },
-        ).json()["result"]
+        vector = rag._embed_query(query)
+        with step("rag", "rag.qdrant.kb", collection=collection_name()) as detail:
+            matches = rag._qdrant_request(
+                "POST",
+                f"/collections/{collection_name()}/points/search",
+                json={
+                    "vector": vector,
+                    "limit": limit,
+                    "with_payload": True,
+                    "score_threshold": settings.rag_score_threshold,
+                },
+            ).json()["result"]
+            detail["matches"] = len(matches)
         return [{
             "url": (match.get("payload") or {}).get("url", ""),
             "title": (match.get("payload") or {}).get("title", ""),

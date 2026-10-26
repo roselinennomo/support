@@ -67,6 +67,8 @@ Les adresses suivent la validation standard, avec une exception limitée au suff
 
 ## RAG et corpus documentaire
 
+Indexation (corpus, KB, documents d'entreprise) : elle ne s'exécute **jamais dans la requête d'un utilisateur** au-delà de ~1 Mo de fichiers à traiter (sinon arrière-plan), elle écrit dans Qdrant **lot par lot** (reprise exacte après une interruption : seuls les extraits manquants sont recalculés; un document n'est « indexé » que lorsque tous ses extraits sont présents, sinon « Indexation partielle »), un seul lot d'indexation est calculé à la fois pour laisser un emplacement libre aux questions, et l'embedding d'une question est calculé une fois pour les trois recherches (cache de 60 s). Au démarrage, l'API reprend en arrière-plan l'indexation interrompue.
+
 - Monter les documents dans `support_docs` (bind mount en lecture seule dans Compose). Formats indexés : PDF avec texte extractible, `.md`, `.markdown` et `.txt`; les PDF scannés nécessitent un OCR non encore intégré. Une page PDF illisible est ignorée avec un avertissement en log; un fichier sans texte extractible n'alimente pas le contexte.
 - À chaque appel de diagnostic ou d'aide agent, synchroniser le corpus par empreinte, puis intégrer les meilleurs extraits dans le prompt. Le premier appel peut être plus long lors de l'indexation initiale ou après un grand ajout de documents.
 - Qdrant stocke les vecteurs et métadonnées dans le volume `qdrant-data`; les documents originaux restent dans `support_docs`. Pour reconstruire l'index, retirer uniquement le volume vectoriel puis redémarrer; cela supprime l'index, pas le corpus ni les tickets.

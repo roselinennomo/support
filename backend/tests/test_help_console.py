@@ -403,3 +403,196 @@ def test_ticket_assignment_rules_for_agents_admins_and_customers(env):
     assert api.patch(path, headers=headers["admin"], json={"agent_id": admin_id}).json()["assigned_agent_id"] == admin_id  # l'admin se l'attribue
     assert api.patch(path, headers=headers["agent"], json={"agent_id": agent_id}).status_code == 200  # un agent peut reprendre le ticket
     assert api.patch(path, headers=headers["agent"], json={"agent_id": None}).status_code == 200
+
+
+def test_anthropic_uses_the_configured_length_limit_and_flags_truncated_free_text(monkeypatch):
+    sent = {}
+
+    class Response:
+        is_error = False
+
+        def __init__(self, stop_reason):
+            self.stop_reason = stop_reason
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"content": [{"text": "Début de réponse"}], "usage": {"input_tokens": 1, "output_tokens": 4096}, "stop_reason": self.stop_reason}
+
+    def post(url, headers, json, timeout):
+        sent.update(json)
+        return Response(sent_stop[0])
+
+    sent_stop = ["max_tokens"]
+    monkeypatch.setattr(ai.settings, "anthropic_api_key", "cle-de-test")
+    monkeypatch.setattr(ai.httpx, "post", post)
+    token = ai._json_format.set(False)
+    try:
+        truncated = ai._call_anthropic("q", "claude-x", timeout=5)
+        sent_stop[0] = "end_turn"
+        complete = ai._call_anthropic("q", "claude-x", timeout=5)
+    finally:
+        ai._json_format.reset(token)
+    assert sent["max_tokens"] == ai.settings.anthropic_max_tokens >= 4096
+    assert "Réponse tronquée" in truncated and complete == "Début de réponse"
+
+
+def test_model_json_is_extracted_from_fences_and_prose_and_garbage_is_explained():
+    payload = '{"reply": "Bonjour", "priority": "high", "recommendations": [], "resolved": false, "escalation_recommended": false}'
+    assert ai._parse_customer_result(f"```json\n{payload}\n```")["reply"] == "Bonjour"
+    assert ai._parse_customer_result(f"Voici ma réponse :\n{payload}\nBonne journée.")["priority"] == "high"
+    assert ai._parse_customer_result(payload)["reply"] == "Bonjour"
+    with pytest.raises(ValueError, match="début : « Je suis désolé"):
+        ai._parse_customer_result("Je suis désolé, je ne peux pas répondre en JSON.")
+    with pytest.raises(ValueError, match="réponse vide"):
+        ai._parse_customer_result("   ")
+
+
+def test_console_failures_are_recorded_and_diagnostics_can_filter_them(env, monkeypatch):
+    from app.models import AIFailure
+
+    api, factory, headers, ids = env
+    monkeypatch.setattr("app.database.SessionLocal", factory)
+    monkeypatch.setattr(ai, "routing_for", lambda task, role: (True, [{"provider": "anthropic", "model": "claude-x", "think": False, "timeout_seconds": 5}]))
+
+    def boom(prompt, model=None, timeout=5):
+        raise RuntimeError("Erreur API Anthropic (529) : surcharge")
+
+    monkeypatch.setattr(ai, "_call_anthropic", boom)
+    with pytest.raises(ai.AIAnalysisError):
+        ai.help_console_answer("Question", ids["agent"])
+    with factory() as db:
+        failure = db.scalar(select(AIFailure))
+        assert failure.user_id == ids["agent"] and failure.provider == "anthropic" and "surcharge" in failure.error
+
+    monkeypatch.setattr("app.ai_observability.provider_catalog", lambda: [])
+    monkeypatch.setattr("app.ai_observability.embedding_status", lambda: {})
+    monkeypatch.setattr("app.ai_observability.qdrant_status", lambda: {})
+    everything = api.get("/api/admin/ai/diagnostics", headers=headers["admin"]).json()
+    assert [(f["source"], f["reference"]) for f in everything["recent_failures"]] == [("console", "Console d’aide")]
+    assert everything["console"]["failures_24h"] == 1 and everything["console"]["users"][0]["id"] == ids["agent"]
+    assert api.get("/api/admin/ai/diagnostics?source=ticket", headers=headers["admin"]).json()["recent_failures"] == []
+    only_console = api.get(f"/api/admin/ai/diagnostics?source=console&user_id={ids['agent']}", headers=headers["admin"]).json()
+    assert len(only_console["recent_failures"]) == 1
+    assert api.get("/api/admin/ai/diagnostics?source=console&user_id=inconnu", headers=headers["admin"]).json()["recent_failures"] == []
+    assert api.get("/api/admin/ai/diagnostics?source=nimporte", headers=headers["admin"]).status_code == 422
+
+
+def test_traced_runs_record_rag_and_provider_steps_and_the_timeline_explains_the_delay(env, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from app.ai_steps import step, traced_run
+    from app.models import AIStep
+
+    api, factory, headers, ids = env
+    monkeypatch.setattr("app.database.SessionLocal", factory)
+
+    @traced_run("Diagnostic client (IA)")
+    def run(ticket_id):
+        with step("rag", "rag.search", query_chars=42) as detail:
+            detail["results"] = 3
+        ai.record_step("provider", "ollama/deepseek-r1:1.5b", "failed", datetime.now(timezone.utc), 95_000, {"error": "délai dépassé"})
+        ai.record_step("provider", "anthropic/claude-x", "ok", datetime.now(timezone.utc), 4_200, {"output_tokens": 300})
+
+    run(ids["ticket"])
+    ai.record_step("provider", "hors exécution", "ok", datetime.now(timezone.utc), 1)  # sans exécution : ignoré
+    with factory() as db:
+        rows = db.scalars(select(AIStep).order_by(AIStep.id)).all()
+        assert [(row.kind, row.name) for row in rows] == [
+            ("rag", "rag.search"), ("provider", "ollama/deepseek-r1:1.5b"), ("provider", "anthropic/claude-x"), ("run", "Diagnostic client (IA)"),
+        ]
+        assert len({row.run_id for row in rows}) == 1 and rows[1].status == "failed" and rows[0].detail == {"query_chars": 42, "results": 3}
+        # Réponse IA publiée 100 s après la création du ticket : le temps perçu dépasse largement les appels réussis.
+        ticket = db.get(Ticket, ids["ticket"])
+        assistant = db.scalar(select(User).where(User.role == "agent"))
+        assistant.role = "system"
+        from app.models import Message
+
+        db.add(Message(ticket_id=ticket.id, author_id=assistant.id, body="SECRET-CONTENU", visibility="public",
+                       created_at=ticket.created_at + timedelta(seconds=100) if ticket.created_at.tzinfo else datetime.now(timezone.utc)))
+        ticket.created_at = datetime.now(timezone.utc) - timedelta(seconds=100)
+        db.commit()
+        for row in rows:
+            row.started_at = ticket.created_at + timedelta(seconds=2)
+        db.commit()
+        db.query(Message).update({"created_at": ticket.created_at + timedelta(seconds=100)})
+        db.commit()
+
+    timeline = api.get("/api/admin/ai/ticket-timeline?reference=oxe-test0001", headers=headers["admin"])
+    assert timeline.status_code == 200
+    body = timeline.json()
+    assert body["tracing_complete"] is True and [item["id"] for item in body["participants"]][:3] == ["actor", "api", "task"]
+    kinds = [item["kind"] for item in body["entries"]]
+    assert kinds[0] == "ticket" and {"run", "rag", "provider", "message"} <= set(kinds)
+    latency = body["latencies"][0]
+    assert 99_000 <= latency["perceived_ms"] <= 101_000 and latency["provider_ok_ms"] == 4_200 and latency["provider_failed_ms"] == 95_000
+    assert latency["failed_attempts"] == ["ollama/deepseek-r1:1.5b"]
+    assert "SECRET-CONTENU" not in str(body)  # aucun contenu de message
+    assert api.get("/api/admin/ai/ticket-timeline?reference=OXE-INCONNU", headers=headers["admin"]).status_code == 404
+    assert api.get("/api/admin/ai/ticket-timeline?reference=OXE-TEST0001", headers=headers["agent"]).status_code == 403
+
+
+def test_timeline_adds_wait_entries_for_queue_untracked_time_and_legacy_preparation(env):
+    from datetime import datetime, timedelta, timezone
+
+    from app.models import AIExecution, AIStep, Message
+    from app.ticket_timeline import build_timeline
+
+    _api, factory, _headers, ids = env
+    with factory() as db:
+        ticket = db.get(Ticket, ids["ticket"])
+        base = datetime.now(timezone.utc) - timedelta(minutes=10)
+        ticket.created_at = base
+        system = db.scalar(select(User).where(User.role == "agent"))
+        system.role = "system"
+        # ticket antérieur au traçage : appel de 5 s terminé 60 s après la création, réponse publiée juste après
+        db.add(AIExecution(ticket_id=ticket.id, customer_id=ids["agent"], task="customer_diagnosis", provider="anthropic", model="claude-x",
+                           duration_ms=5_000, created_at=base + timedelta(seconds=60)))
+        db.add(Message(ticket_id=ticket.id, author_id=system.id, body="x", visibility="public", created_at=base + timedelta(seconds=60, milliseconds=30)))
+        db.commit()
+        legacy = build_timeline(db, ticket)
+        waits = [item for item in legacy["entries"] if item["kind"] == "wait"]
+        assert len(waits) == 1 and 54_000 <= waits[0]["duration_ms"] <= 56_000 and "non détaillée" in waits[0]["title"]
+
+        # ticket tracé : 20 s de file d'attente, traitement de 30 s dont 10 s détaillées
+        db.query(AIExecution).delete()
+        db.add(AIStep(run_id="r1", ticket_id=ticket.id, label="Diagnostic client (IA)", kind="run", name="Diagnostic client (IA)", status="ok",
+                      started_at=base + timedelta(seconds=20), duration_ms=40_000))
+        db.add(AIStep(run_id="r1", ticket_id=ticket.id, label="Diagnostic client (IA)", kind="provider", name="anthropic/claude-x", status="ok",
+                      started_at=base + timedelta(seconds=50), duration_ms=10_000, detail={}))
+        db.query(Message).update({"created_at": base + timedelta(seconds=60, milliseconds=30)})
+        db.commit()
+        traced = build_timeline(db, ticket)
+        titles = [(item["title"], item["duration_ms"]) for item in traced["entries"] if item["kind"] == "wait"]
+        assert ("Attente avant le démarrage du traitement", 20_000) in [(t, round(d, -3)) for t, d in titles]
+        assert any(t == "Temps du traitement non détaillé" and 29_000 <= d <= 31_000 for t, d in titles)
+        latency = traced["latencies"][0]
+        assert latency["queue_ms"] >= 19_000 and latency["provider_ok_ms"] == 10_000
+
+
+def test_internal_notes_are_not_counted_as_responses_and_waits_are_not_duplicated(env):
+    from datetime import datetime, timedelta, timezone
+
+    from app.models import AIExecution, Message
+    from app.ticket_timeline import build_timeline
+
+    _api, factory, _headers, ids = env
+    with factory() as db:
+        ticket = db.get(Ticket, ids["ticket"])
+        base = datetime.now(timezone.utc) - timedelta(minutes=20)
+        ticket.created_at = base
+        system = db.scalar(select(User).where(User.role == "agent"))
+        system.role = "system"
+        db.add(AIExecution(ticket_id=ticket.id, customer_id=ids["agent"], task="customer_diagnosis", provider="anthropic", model="x",
+                           duration_ms=3_000, created_at=base + timedelta(seconds=40)))
+        db.add_all([
+            Message(ticket_id=ticket.id, author_id=system.id, body="a", visibility="public", created_at=base + timedelta(seconds=40)),
+            Message(ticket_id=ticket.id, author_id=system.id, body="liste KB", visibility="internal", created_at=base + timedelta(seconds=300)),
+        ])
+        db.commit()
+        timeline = build_timeline(db, ticket)
+    assert len(timeline["latencies"]) == 1  # la note interne automatique n'est pas une réponse à un message
+    waits = [item for item in timeline["entries"] if item["kind"] == "wait"]
+    assert len(waits) == 1
+    assert any(item["title"] == "Note interne de l'assistant" for item in timeline["entries"])

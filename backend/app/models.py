@@ -259,6 +259,38 @@ class AIExecution(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class AIStep(Base):
+    """Étape horodatée d'un traitement IA lié à un ticket (voir app/ai_steps.py) : durées et compteurs, jamais de contenu."""
+
+    __tablename__ = "ai_steps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    ticket_id: Mapped[str | None] = mapped_column(ForeignKey("tickets.id"), nullable=True, index=True)
+    label: Mapped[str] = mapped_column(String(80))  # traitement : « Diagnostic client (IA) », « Aide IA agent »…
+    kind: Mapped[str] = mapped_column(String(20))  # run | rag | provider
+    name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(10), default="ok")  # ok | failed
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class AIFailure(Base):
+    """Échec d'un appel IA hors ticket (console d'aide) : les échecs de tickets sont des événements de ticket."""
+
+    __tablename__ = "ai_failures"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    task: Mapped[str] = mapped_column(String(80))
+    provider: Mapped[str] = mapped_column(String(30), index=True)
+    model: Mapped[str] = mapped_column(String(200))
+    error: Mapped[str] = mapped_column(Text, default="")
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class AIModelPrice(Base):
     __tablename__ = "ai_model_prices"
     __table_args__ = (UniqueConstraint("provider", "model", name="uq_ai_model_price_provider_model"),)

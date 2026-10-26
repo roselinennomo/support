@@ -13,7 +13,7 @@ const API = import.meta.env.VITE_API_BASE || '/api'
 const NAVIGATION_STORAGE_KEY = 'oxe-navigation'
 const NAVIGABLE_PAGES = new Set([
   'home', 'new', 'ticket', 'supervision', 'ai-routing', 'ai-traces', 'ai-costs', 'ai-consent',
-  'help', 'rag', 'kb', 'company-docs', 'companies', 'access-requests', 'team', 'profile', 'ai-diagnostics', 'service', 'billing',
+  'help', 'rag', 'kb', 'company-docs', 'companies', 'access-requests', 'team', 'profile', 'ai-diagnostics', 'ai-ticket', 'service', 'billing',
 ])
 const statuses = {
   ai_triage: ['Diagnostic IA', 'amber'],
@@ -78,6 +78,24 @@ function date(value) {
 function Badge({ value, map = statuses }) {
   const [label, color] = map[value] || [value, 'gray']
   return <span className={`badge ${color}`}><span className="badge-dot" />{label}</span>
+}
+
+/** Indicateur de chargement : plein cadre (esquisse de contenu) ou en ligne. */
+function Loader({ label = 'Chargement…', inline = false }) {
+  return <div className={`loader ${inline ? 'inline' : ''}`} role="status" aria-live="polite">
+    <div className="loader-line"><LoaderCircle size={inline ? 16 : 24} className="ai-thinking-spinner" /><span>{label}</span></div>
+    {!inline && <div className="loader-skeleton" aria-hidden="true"><i /><i /><i /></div>}
+  </div>
+}
+
+/** Page dont les données initiales ne sont pas encore arrivées : titre, chargement, ou erreur avec relance. */
+function PageLoader({ eyebrow, title, label, error, onRetry }) {
+  return <div className="page-loader-page">
+    <div className="welcome-row"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1></div></div>
+    {error
+      ? <div className="alert error page-alert"><AlertCircle size={17} />{error}{onRetry && <button onClick={onRetry}>Réessayer</button>}</div>
+      : <section className="panel"><Loader label={label} /></section>}
+  </div>
 }
 
 function Avatar({ name, size = 'normal' }) {
@@ -351,9 +369,263 @@ function ProfilePage({ user, companies, token, onAuthChanged }) {
   </div>
 }
 
+function formatMs(ms) {
+  if (ms == null) return '—'
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  const seconds = ms / 1000
+  if (seconds < 60) return `${seconds.toFixed(1).replace('.', ',')} s`
+  return `${Math.floor(seconds / 60)} min ${String(Math.round(seconds % 60)).padStart(2, '0')} s`
+}
+
+function offsetLabel(ms) {
+  return ms < 1000 ? `+${Math.round(ms)} ms` : `+${formatMs(ms)}`
+}
+
+const timelineKindLabels = { ticket: 'Ticket', message: 'Message', event: 'Événement', run: 'Traitement IA', rag: 'Recherche documentaire', provider: 'Fournisseur LLM', kb: 'KB constructeur', db: 'Base de données', wait: 'Attente' }
+
+function TicketSequenceDiagram({ data, origin, onSelect, selectedIndex }) {
+  const used = data.participants.filter((item) => data.entries.some((entry) => entry.from === item.id || entry.to === item.id))
+  const column = (id) => 96 + used.findIndex((item) => item.id === id) * 170
+  const rowHeight = 30
+  const top = 62
+  const width = 96 + (used.length - 1) * 170 + 120
+  const height = top + data.entries.length * rowHeight + 24
+  const color = (entry) => entry.status === 'failed' ? '#d4524b' : entry.kind === 'provider' ? '#2f9e6e' : entry.kind === 'rag' ? '#6a7fe0' : entry.kind === 'kb' ? '#a05cc4' : entry.kind === 'wait' ? '#e0912f' : entry.kind === 'db' ? '#3d8fa8' : '#7d8aa3'
+  return <div className="timeline-sequence" role="img" aria-label="Diagramme de séquence du parcours du ticket">
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`}>
+      <defs>
+        {['#d4524b', '#2f9e6e', '#6a7fe0', '#a05cc4', '#7d8aa3', '#e0912f', '#3d8fa8'].map((tone) => <marker key={tone} id={`arrow-${tone.slice(1)}`} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill={tone} /></marker>)}
+      </defs>
+      {used.map((item) => <g key={item.id}>
+        <rect x={column(item.id) - 70} y={8} width={140} height={30} rx={6} fill="#eef3ff" stroke="#cbd6ef" />
+        <text x={column(item.id)} y={27} textAnchor="middle" fontSize="11" fontWeight="600" fill="#34445c">{item.label}</text>
+        <line x1={column(item.id)} y1={40} x2={column(item.id)} y2={height - 10} stroke="#cbd6ef" strokeDasharray="4 4" />
+      </g>)}
+      {data.entries.map((entry, index) => {
+        const y = top + index * rowHeight
+        const x1 = column(entry.from)
+        const x2 = column(entry.to)
+        const tone = color(entry)
+        const left = Math.min(x1, x2)
+        const right = Math.max(x1, x2)
+        const label = `${entry.title}${entry.duration_ms >= 500 ? ` · ${formatMs(entry.duration_ms)}` : ''}`
+        const limit = Math.max(14, Math.floor((right - left) / 5.6))
+        return <g key={index} className={`timeline-seq-row ${selectedIndex === entry.index ? 'selected' : ''}`} onClick={() => onSelect(entry)} style={{ cursor: 'pointer' }}>
+          <rect x={0} y={y - 13} width={width} height={rowHeight} fill="transparent" />
+          <title>{`${offsetLabel(new Date(entry.at) - origin)} — ${label}${entry.status === 'failed' ? ' (échec)' : ''}`}</title>
+          <text x={4} y={y + 4} fontSize="10" fill="#95a1b1">{offsetLabel(new Date(entry.at) - origin)}</text>
+          {entry.duration_ms >= 500 && <rect x={x2 - 4} y={y - 9} width={8} height={Math.min(rowHeight * 3, Math.max(10, (entry.duration_ms / 1000) * 2))} rx={2} fill={tone} opacity="0.25" />}
+          <line x1={x1} y1={y} x2={x2 + (x2 >= x1 ? -2 : 2)} y2={y} stroke={tone} strokeWidth="1.6" markerEnd={`url(#arrow-${tone.slice(1)})`} />
+          <text x={(x1 + x2) / 2} y={y - 5} textAnchor="middle" fontSize="10" fill={entry.status === 'failed' ? '#b3403a' : '#4a5a71'}>{label.length > limit ? `${label.slice(0, limit - 1)}…` : label}</text>
+        </g>
+      })}
+    </svg>
+  </div>
+}
+
+/** Échelle de temps de la chronologie : réelle, ou « compressée » (les longues périodes sans aucune activité sont raccourcies). */
+function buildTimeScale(entries, origin, compress) {
+  const spans = entries
+    .map((entry) => [new Date(entry.at).getTime() - origin, new Date(entry.end_at).getTime() - origin])
+    .sort((a, b) => a[0] - b[0])
+  const end = Math.max(1, ...spans.map((span) => span[1]))
+  const real = { total: end, gaps: [], pos: (time) => (time / end) * 100 }
+  if (!compress) return real
+  const threshold = Math.max(15000, end * 0.03) // en dessous, l'écart reste à l'échelle
+  const blocks = []
+  for (const [start, stop] of spans) {
+    const last = blocks[blocks.length - 1]
+    if (last && start - last[1] <= threshold) last[1] = Math.max(last[1], stop)
+    else blocks.push([start, stop])
+  }
+  if (blocks.length < 2) return real
+  const gaps = blocks.slice(1).map((block, index) => ({ from: blocks[index][1], to: block[0] }))
+  const blocksTotal = blocks.reduce((sum, [start, stop]) => sum + Math.max(stop - start, 1), 0)
+  const gapWeight = Math.max(blocksTotal * 0.06, 1500)
+  let weight = 0
+  const pieces = []
+  blocks.forEach(([start, stop], index) => {
+    const size = Math.max(stop - start, 1)
+    pieces.push({ start, stop, from: weight, size, gap: false })
+    weight += size
+    if (gaps[index]) {
+      pieces.push({ start: gaps[index].from, stop: gaps[index].to, from: weight, size: gapWeight, gap: true })
+      weight += gapWeight
+    }
+  })
+  const pos = (time) => {
+    const piece = pieces.find((item) => time >= item.start && time <= item.stop) || pieces[pieces.length - 1]
+    const ratio = piece.stop === piece.start ? 0 : (time - piece.start) / (piece.stop - piece.start)
+    return ((piece.from + ratio * piece.size) / weight) * 100
+  }
+  return {
+    total: end,
+    pos,
+    gaps: pieces.filter((item) => item.gap).map((item) => ({ ...item, left: pos(item.start), width: pos(item.stop) - pos(item.start) })),
+  }
+}
+
+function TicketWaterfall({ data, origin, onSelect, selectedIndex }) {
+  const [compress, setCompress] = useState(() => {
+    try { return localStorage.getItem('oxe-timeline-compress') !== '0' } catch { return true }
+  })
+  const scale = useMemo(() => buildTimeScale(data.entries, origin, compress), [data.entries, origin, compress])
+  const toggle = (value) => {
+    setCompress(value)
+    try { localStorage.setItem('oxe-timeline-compress', value ? '1' : '0') } catch { /* ignoré */ }
+  }
+  const tone = (entry) => `tl-${entry.status === 'failed' ? 'failed' : entry.kind}`
+  const hidden = scale.gaps.reduce((sum, gap) => sum + (gap.stop - gap.start), 0)
+  return <div className="timeline-waterfall">
+    <div className="timeline-scale-mode" role="group" aria-label="Échelle de temps">
+      <button type="button" className={compress ? 'active' : ''} onClick={() => toggle(true)}>Échelle compressée</button>
+      <button type="button" className={!compress ? 'active' : ''} onClick={() => toggle(false)}>Échelle réelle</button>
+      <small>{compress
+        ? (scale.gaps.length ? `${scale.gaps.length} période${scale.gaps.length > 1 ? 's' : ''} d’inactivité raccourcie${scale.gaps.length > 1 ? 's' : ''} (${formatMs(hidden)} au total), repérées par les zones hachurées.` : 'Aucune longue période d’inactivité : l’échelle est réelle.')
+        : 'Les durées sont proportionnelles au temps réel.'}</small>
+    </div>
+    <div className="timeline-row timeline-axis-row">
+      <span className="timeline-row-label" />
+      <div className="timeline-axis">
+        <span className="timeline-axis-tick" style={{ left: 0 }}>0</span>
+        {scale.gaps.map((gap, index) => gap.width > 3 && <span key={index} className="timeline-axis-gap" style={{ left: `${gap.left + gap.width / 2}%` }}>⋯ {formatMs(gap.stop - gap.start)}</span>)}
+        {!compress && <span className="timeline-axis-tick" style={{ left: '50%' }}>{formatMs(scale.total / 2)}</span>}
+        <span className="timeline-axis-tick end" style={{ right: 0 }}>{formatMs(scale.total)}</span>
+      </div>
+      <span />
+    </div>
+    {data.entries.map((entry, index) => {
+      const start = new Date(entry.at).getTime() - origin
+      const left = scale.pos(start)
+      const width = scale.pos(start + entry.duration_ms) - left
+      return <div className={`timeline-row ${selectedIndex === entry.index ? 'selected' : ''}`} key={index} onClick={() => onSelect(entry)} title={`${timelineKindLabels[entry.kind] || entry.kind} — ${entry.title}`}>
+        <span className="timeline-row-label">{entry.title}</span>
+        <div className="timeline-track">
+          {scale.gaps.map((gap, position) => <span key={position} className="timeline-gap" style={{ left: `${gap.left}%`, width: `${gap.width}%` }} />)}
+          {entry.duration_ms >= 1
+            ? <span className={`timeline-bar ${tone(entry)}`} style={{ left: `${left}%`, width: `${Math.max(0.5, width)}%` }} />
+            : <span className={`timeline-dot ${tone(entry)}`} style={{ left: `${left}%` }} />}
+        </div>
+        <span className="timeline-row-duration">{entry.duration_ms >= 1 ? formatMs(entry.duration_ms) : offsetLabel(start)}</span>
+      </div>
+    })}
+  </div>
+}
+
+function TicketTimelinePage({ token }) {
+  const [reference, setReference] = useState(() => {
+    try { return sessionStorage.getItem('oxe-timeline-reference') || '' } catch { return '' }
+  })
+  const [data, setData] = useState(null)
+  const [view, setView] = useState('sequence')
+  const [selected, setSelected] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [filterKind, setFilterKind] = useState('all')
+  const [selectedEntry, setSelectedEntry] = useState(null)
+
+  const load = useCallback(async (value) => {
+    const ref = value.trim()
+    if (!ref) return
+    setLoading(true); setError('')
+    try {
+      const result = await request(`/admin/ai/ticket-timeline?${new URLSearchParams({ reference: ref })}`, { token })
+      setData(result)
+      setSelectedEntry(null)
+      setSelected(Math.max(0, result.latencies.length - 1))
+      try { sessionStorage.setItem('oxe-timeline-reference', ref.toUpperCase()) } catch { /* ignoré */ }
+    } catch (err) {
+      setError(err.message); setData(null)
+    } finally {
+      setLoading(false)
+    }
+  }, [token])
+
+  useEffect(() => { if (reference) load(reference) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const origin = data ? new Date(data.entries[0].at).getTime() : 0
+  const latency = data?.latencies?.[selected]
+  const explained = latency ? latency.provider_ok_ms + latency.provider_failed_ms + latency.rag_ms : 0
+  const rows = data ? data.entries.filter((entry) => filterKind === 'all' || entry.kind === filterKind) : []
+  const pager = usePagination(rows, { storageKey: 'ticket-timeline', initialSize: 25, resetKey: `${data?.reference}-${filterKind}` })
+
+  return <div className="ticket-timeline-page">
+    <div className="welcome-row">
+      <div><span className="eyebrow">OUTILS ADMINISTRATEUR</span><h1>Diagnostic ticket</h1><p>Reconstitue, instant par instant, ce qui s’est passé pour un ticket : messages, traitements IA, recherche documentaire, tentatives auprès des modèles et recherche KB. Seules les durées et les états sont affichés, jamais le contenu des échanges.</p></div>
+    </div>
+    <section className="panel">
+      <form className="ai-diagnostic-search timeline-search" onSubmit={(event) => { event.preventDefault(); load(reference) }}>
+        <input aria-label="Référence du ticket" value={reference} onChange={(event) => setReference(event.target.value)} placeholder="Ex. OXE-AAA0B94D" />
+        <button className="button primary" disabled={loading || !reference.trim()}><Search size={15} />{loading ? 'Analyse…' : 'Analyser le parcours'}</button>
+      </form>
+      {error && <div className="alert error"><AlertCircle size={16} />{error}</div>}
+    </section>
+    {loading && !data && <section className="panel"><Loader label="Reconstitution du parcours du ticket…" /></section>}
+
+    {data && <>
+      <section className="panel timeline-summary">
+        <div className="panel-head"><div><h2>{data.reference} — {data.title}</h2><p>Statut {data.status} · IA {data.ai_status}{data.ai_error ? ` · dernière erreur : ${data.ai_error}` : ''}</p></div><Activity size={19} className="muted-icon" /></div>
+        {!data.tracing_complete && <div className="alert warning timeline-note"><AlertCircle size={16} />Ce ticket est antérieur au traçage détaillé : aucune étape (embeddings, Qdrant, documents d’entreprise, KB, base de données) n’a été enregistrée pour lui. Seules les durées des appels aux modèles sont reconstituées; tout ce qui précède l’appel apparaît en « Préparation avant l’appel au modèle (non détaillée) ». Créez un nouveau ticket pour obtenir toutes les étapes.</div>}
+        {data.latencies.length > 1 && <label className="timeline-latency-select">Réponse IA analysée<select value={selected} onChange={(event) => setSelected(Number(event.target.value))}>{data.latencies.map((item, index) => <option key={index} value={index}>Réponse n°{index + 1} — {date(item.response_at)} ({formatMs(item.perceived_ms)})</option>)}</select></label>}
+        {latency ? <>
+          <div className="timeline-cards">
+            <div className="timeline-card perceived"><span>Temps perçu par l’utilisateur</span><strong>{formatMs(latency.perceived_ms)}</strong><small>du message déclencheur à la réponse publiée</small></div>
+            <div className="timeline-card ok"><span>Appels de modèle réussis</span><strong>{formatMs(latency.provider_ok_ms)}</strong><small>ce que voit « Coûts IA » / traces</small></div>
+            <div className={`timeline-card ${latency.provider_failed_ms ? 'failed' : ''}`}><span>Tentatives en échec</span><strong>{formatMs(latency.provider_failed_ms)}</strong><small>{latency.failed_attempts.length ? latency.failed_attempts.join(', ') : 'aucune'}</small></div>
+            <div className="timeline-card rag"><span>Recherche documentaire</span><strong>{formatMs(latency.rag_ms)}</strong><small>synchronisation, embeddings, Qdrant, KB</small></div>
+            {data.tracing_complete && <div className="timeline-card wait"><span>File d’attente</span><strong>{formatMs(latency.queue_ms)}</strong><small>avant le démarrage de la tâche de fond</small></div>}
+            {data.tracing_complete && <div className="timeline-card"><span>Base de données</span><strong>{formatMs(latency.db_ms)}</strong><small>chargement du contexte, enregistrement</small></div>}
+            <div className="timeline-card"><span>Non tracé</span><strong>{formatMs(latency.other_ms)}</strong><small>file d’attente, chargement, enregistrement</small></div>
+          </div>
+          <div className="timeline-stack" aria-label="Répartition du temps perçu">
+            {[['ok', latency.provider_ok_ms], ['failed', latency.provider_failed_ms], ['rag', latency.rag_ms], ['wait', latency.queue_ms], ['db', latency.db_ms], ['other', latency.other_ms]].map(([name, value]) => value > 0 && <span key={name} className={`timeline-stack-part ${name}`} style={{ width: `${(value / Math.max(1, latency.perceived_ms)) * 100}%` }} title={`${formatMs(value)}`} />)}
+          </div>
+          <p className="timeline-insight">{latency.provider_failed_ms > latency.provider_ok_ms
+            ? `L’essentiel du délai vient de tentatives en échec (${formatMs(latency.provider_failed_ms)}) avant la réponse réussie : ${latency.failed_attempts.join(', ')}. Les durées affichées dans les traces ne comptent que l’appel réussi (${formatMs(latency.provider_ok_ms)}).`
+            : latency.rag_ms > latency.provider_ok_ms
+              ? `La recherche documentaire (${formatMs(latency.rag_ms)}) dure plus longtemps que l’appel au modèle (${formatMs(latency.provider_ok_ms)}).`
+              : explained < latency.perceived_ms * 0.5 && data.tracing_complete
+                ? `La moitié du temps perçu (${formatMs(latency.other_ms)}) n’est attribuée à aucune étape : file d’attente, interrogation périodique de l’interface ou enregistrement.`
+                : `Le temps est principalement passé dans l’appel au modèle (${formatMs(latency.provider_ok_ms)}).`}</p>
+        </> : <p className="ai-diagnostic-empty">Aucune réponse IA publiée pour ce ticket.</p>}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head"><div><h2>Parcours détaillé</h2><p>{data.entries.length} étape{data.entries.length > 1 ? 's' : ''} sur {formatMs(Math.max(...data.entries.map((entry) => new Date(entry.end_at).getTime())) - origin)}.</p></div></div>
+        <div className="timeline-tabs" role="tablist">
+          {[['sequence', 'Diagramme de séquence'], ['waterfall', 'Chronologie'], ['table', 'Tableau']].map(([key, label]) => <button key={key} role="tab" aria-selected={view === key} className={view === key ? 'active' : ''} onClick={() => setView(key)}>{label}</button>)}
+        </div>
+        <div className="timeline-legend"><span className="ok">Fournisseur</span><span className="rag">Recherche documentaire</span><span className="kb">KB</span><span className="db">Base de données</span><span className="wait">Attente</span><span className="failed">Échec</span><span className="other">Message / événement</span></div>
+        {view === 'sequence' && <div className="timeline-scroll"><TicketSequenceDiagram data={data} origin={origin} onSelect={setSelectedEntry} selectedIndex={selectedEntry?.index} /></div>}
+        {view === 'waterfall' && <TicketWaterfall data={data} origin={origin} onSelect={setSelectedEntry} selectedIndex={selectedEntry?.index} />}
+        {view !== 'table' && <div className="timeline-detail-panel">{selectedEntry
+          ? <><div className="timeline-detail-head"><strong>{selectedEntry.title}</strong><span className={`badge ${selectedEntry.status === 'failed' ? 'red' : 'green'}`}>{selectedEntry.status === 'failed' ? 'Échec' : 'OK'}</span><button type="button" className="icon-button" aria-label="Fermer le détail" onClick={() => setSelectedEntry(null)}>×</button></div>
+            <dl>
+              <div><dt>Type</dt><dd>{timelineKindLabels[selectedEntry.kind] || selectedEntry.kind}</dd></div>
+              <div><dt>Début</dt><dd>{new Intl.DateTimeFormat('fr-FR', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(selectedEntry.at))} ({offsetLabel(new Date(selectedEntry.at) - origin)})</dd></div>
+              <div><dt>Durée</dt><dd>{selectedEntry.duration_ms ? formatMs(selectedEntry.duration_ms) : 'instantané'}</dd></div>
+              <div><dt>Échange</dt><dd>{(data.participants.find((p) => p.id === selectedEntry.from) || {}).label} → {(data.participants.find((p) => p.id === selectedEntry.to) || {}).label}</dd></div>
+              {Object.entries(selectedEntry.detail || {}).filter(([, value]) => value !== '' && value != null).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</dd></div>)}
+            </dl></>
+          : <p className="ai-diagnostic-empty">Cliquez sur une ligne du diagramme ou de la chronologie pour afficher tous ses détails.</p>}</div>}
+        {view === 'table' && <>
+          <div className="timeline-filter"><label>Type<select value={filterKind} onChange={(event) => setFilterKind(event.target.value)}><option value="all">Tous</option>{Object.entries(timelineKindLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label></div>
+          <div className="ai-diagnostic-table-wrap"><table className="ai-diagnostic-table"><thead><tr><th>Heure</th><th>Décalage</th><th>Durée</th><th>Type</th><th>Étape</th><th>Détails</th></tr></thead><tbody>
+            {pager.items.map((entry) => <tr key={entry.index} className={entry.status === 'failed' ? 'failed-row' : ''}><td>{new Intl.DateTimeFormat('fr-FR', { timeStyle: 'medium' }).format(new Date(entry.at))}</td><td>{offsetLabel(new Date(entry.at) - origin)}</td><td>{entry.duration_ms ? formatMs(entry.duration_ms) : '—'}</td><td>{timelineKindLabels[entry.kind] || entry.kind}</td><td>{entry.title}{entry.status === 'failed' ? ' — échec' : ''}</td><td className="timeline-detail">{Object.entries(entry.detail || {}).filter(([, value]) => value !== '' && value != null).map(([key, value]) => `${key} : ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`).join(' · ') || '—'}</td></tr>)}
+          </tbody></table></div>
+          <Pagination {...pager} sizes={[25, 50, 100]} label="étapes" />
+        </>}
+      </section>
+    </>}
+  </div>
+}
+
 function AIDiagnosticsPage({ token }) {
   const [diagnostics, setDiagnostics] = useState(null)
   const [reference, setReference] = useState('')
+  const [source, setSource] = useState('all')
+  const [userFilter, setUserFilter] = useState('')
+  const lastReference = useRef('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
@@ -361,10 +633,12 @@ function AIDiagnosticsPage({ token }) {
     setLoading(true)
     setError('')
     try {
-      const query = ticketReference.trim()
-        ? `?${new URLSearchParams({ reference: ticketReference.trim() })}`
-        : ''
-      setDiagnostics(await request(`/admin/ai/diagnostics${query}`, { token }))
+      const params = new URLSearchParams()
+      if (ticketReference.trim()) params.set('reference', ticketReference.trim())
+      if (source !== 'all') params.set('source', source)
+      if (userFilter && source !== 'ticket') params.set('user_id', userFilter)
+      lastReference.current = ticketReference.trim()
+      setDiagnostics(await request(`/admin/ai/diagnostics${params.size ? `?${params}` : ''}`, { token }))
       if (ticketReference.trim()) setReference(ticketReference.trim().toUpperCase())
     } catch (err) {
       setError(err.message)
@@ -372,13 +646,15 @@ function AIDiagnosticsPage({ token }) {
     } finally {
       setLoading(false)
     }
-  }, [token])
+  }, [token, source, userFilter])
 
-  useEffect(() => { load() }, [load])
+  useEffect(() => { load(lastReference.current) }, [load])
 
   function statusLabel(status) {
     return ({ healthy: 'Disponible', responded: 'A répondu', configured: 'Configuré', warning: 'À vérifier', down: 'Indisponible', disabled: 'Désactivé', unconfigured: 'Non configuré' })[status] || status
   }
+
+  if (!diagnostics) return <PageLoader eyebrow="OUTILS ADMINISTRATEUR" title="Diagnostic IA" label="Vérification des fournisseurs, des embeddings et du routage…" error={error} onRetry={() => load(reference)} />
 
   return <div className="ai-diagnostics-page">
     <div className="welcome-row">
@@ -450,12 +726,29 @@ function AIDiagnosticsPage({ token }) {
       </div>}
     </section>
 
+    <section className="panel ai-diagnostic-console">
+      <div className="panel-head"><div><h2>Console d’aide</h2><p>Activité IA hors ticket : {diagnostics?.console?.executions_24h ?? 0} appel{(diagnostics?.console?.executions_24h ?? 0) > 1 ? 's' : ''} réussi{(diagnostics?.console?.executions_24h ?? 0) > 1 ? 's' : ''} et {diagnostics?.console?.failures_24h ?? 0} échec{(diagnostics?.console?.failures_24h ?? 0) > 1 ? 's' : ''} sur les dernières 24 h.</p></div><Sparkles size={19} className="muted-icon" /></div>
+      {diagnostics?.console?.recent_executions?.length
+        ? <div className="ai-diagnostic-table-wrap"><table className="ai-diagnostic-table"><thead><tr><th>Date</th><th>Utilisateur</th><th>Tâche</th><th>Fournisseur / modèle</th><th>Tokens entrée/sortie</th><th>Durée</th></tr></thead><tbody>
+          {diagnostics.console.recent_executions.map((execution, index) => <tr key={`${execution.created_at}-${index}`}><td>{date(execution.created_at)}</td><td>{execution.user}</td><td>{execution.task}</td><td>{execution.provider}/{execution.model}</td><td>{execution.input_tokens} / {execution.output_tokens}</td><td>{(execution.duration_ms / 1000).toFixed(1)} s</td></tr>)}
+        </tbody></table></div>
+        : <p className="ai-diagnostic-empty">Aucun appel réussi de la console d’aide{userFilter ? ' pour cet utilisateur' : ''}.</p>}
+    </section>
+
     <section className="panel ai-diagnostic-failures">
-      <div className="panel-head"><div><h2>Échecs récents</h2><p>Derniers échecs de diagnostic client et de résumé de transfert.</p></div><AlertCircle size={19} className="muted-icon" /></div>
+      <div className="panel-head"><div><h2>Échecs récents</h2><p>Derniers échecs de diagnostic client, de résumé de transfert et de la console d’aide.</p></div><AlertCircle size={19} className="muted-icon" /></div>
+      <div className="ai-diagnostic-filters">
+        <label>Origine<select value={source} onChange={(event) => { setSource(event.target.value); if (event.target.value === 'ticket') setUserFilter('') }}><option value="all">Tickets et console d’aide</option><option value="ticket">Tickets seulement</option><option value="console">Console d’aide seulement</option></select></label>
+        {source !== 'ticket' && <label>Utilisateur de la console<select value={userFilter} onChange={(event) => setUserFilter(event.target.value)}><option value="">Tous</option>{(diagnostics?.console?.users || []).map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></label>}
+      </div>
       <div className="ai-diagnostic-failure-list">
-        {(diagnostics?.recent_failures || []).map((failure, index) => <button className="ai-diagnostic-failure" key={`${failure.reference}-${failure.created_at}-${index}`} onClick={() => load(failure.reference)}>
-          <span><strong>{failure.reference}</strong><small>{failure.title}</small></span><span className="ai-diagnostic-failure-message">{failure.provider ? `${failure.provider}/${failure.model} · ` : ''}{failure.task ? `${failure.task} · ` : ''}{failure.message || failure.event_type}</span><time>{date(failure.created_at)}</time><ArrowUpRight size={15} />
-        </button>)}
+        {(diagnostics?.recent_failures || []).map((failure, index) => failure.source === 'console'
+          ? <div className="ai-diagnostic-failure console" key={`console-${failure.created_at}-${index}`}>
+            <span><strong>{failure.reference}</strong><small>{failure.title}</small></span><span className="ai-diagnostic-failure-message">{failure.provider ? `${failure.provider}/${failure.model} · ` : ''}{failure.message || failure.event_type}</span><time>{date(failure.created_at)}</time>
+          </div>
+          : <button className="ai-diagnostic-failure" key={`${failure.reference}-${failure.created_at}-${index}`} onClick={() => load(failure.reference)}>
+            <span><strong>{failure.reference}</strong><small>{failure.title}</small></span><span className="ai-diagnostic-failure-message">{failure.provider ? `${failure.provider}/${failure.model} · ` : ''}{failure.task ? `${failure.task} · ` : ''}{failure.message || failure.event_type}</span><time>{date(failure.created_at)}</time><ArrowUpRight size={15} />
+          </button>)}
         {diagnostics && diagnostics.recent_failures.length === 0 && <p className="ai-diagnostic-empty">Aucun échec récent enregistré.</p>}
       </div>
     </section>
@@ -476,6 +769,7 @@ function ServicePortalPage({ token, user, companies }) {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const isCustomer = user.role === 'customer'
+  const [loaded, setLoaded] = useState(false)
 
   const load = useCallback(async () => {
     setError('')
@@ -495,6 +789,8 @@ function ServicePortalPage({ token, user, companies }) {
       }
     } catch (err) {
       setError(err.message)
+    } finally {
+      setLoaded(true)
     }
   }, [token, user.role, selectedCompany, period.invoice])
 
@@ -576,6 +872,8 @@ function ServicePortalPage({ token, user, companies }) {
   const reportPager = usePagination(reports, { storageKey: 'reports', initialSize: 5 })
   const invoicePager = usePagination(invoices, { storageKey: 'invoices', initialSize: 5 })
 
+  if (!loaded) return <PageLoader eyebrow="SERVICE" title="SLA, rapports et factures" label="Chargement des SLA, rapports et factures…" />
+
   return <div className="team-page service-portal-page">
     <div className="welcome-row"><div><span className="eyebrow">CONTRATS & SUIVI</span><h1>SLA, rapports et factures</h1><p>Propositions de niveaux de service, suivi des unités et documents de période.</p></div><button className="button secondary" onClick={load} disabled={busy}><RefreshCw size={15} />Actualiser</button></div>
     {error && <div className="alert error page-alert">{error}</div>}
@@ -640,6 +938,7 @@ async function downloadPdf(path, token, filename) {
 
 function BillingAdminPage({ token }) {
   const [companies, setCompanies] = useState([])
+  const [loaded, setLoaded] = useState(false)
   const [selectedId, setSelectedId] = useState('')
   const [form, setForm] = useState(null)
   const [credits, setCredits] = useState({ ticket_credits: 0, month_credits: 0, note: '' })
@@ -652,7 +951,7 @@ function BillingAdminPage({ token }) {
       const result = await request('/billing/companies', { token })
       setCompanies(result)
       if (!selectedId && result.length) setSelectedId(result[0].id)
-    } catch (err) { setError(err.message) }
+    } catch (err) { setError(err.message) } finally { setLoaded(true) }
   }, [token, selectedId])
   useEffect(() => { load() }, [load])
   useEffect(() => {
@@ -686,6 +985,8 @@ function BillingAdminPage({ token }) {
       await load()
     } catch (err) { setError(err.message) } finally { setBusy(false) }
   }
+  if (!loaded) return <PageLoader eyebrow="ADMINISTRATION FINANCIÈRE" title="Facturation entreprises" label="Chargement des entreprises et de leur facturation…" />
+
   return <div className="team-page billing-admin-page">
     <div className="welcome-row"><div><span className="eyebrow">ADMINISTRATION FINANCIÈRE</span><h1>Facturation entreprises</h1><p>Configurez les tarifs, le paiement et les crédits prépayés.</p></div><button className="button secondary" onClick={load}><RefreshCw size={15} />Actualiser</button></div>
     {error && <div className="alert error page-alert">{error}</div>}{notice && <div className="alert success page-alert">{notice}</div>}
@@ -807,6 +1108,7 @@ function AITracePage({ token }) {
       </div>
     </section>
     <div className="ai-trace-summary"><span>{loading ? 'Chargement…' : `${totalCount} trace${totalCount === 1 ? '' : 's'} trouvée${totalCount === 1 ? '' : 's'}`}</span><span>Prompts et réponses visibles uniquement avec consentement</span></div>
+    {loading && traces.length === 0 && <section className="panel"><Loader label="Chargement des traces…" /></section>}
     {traces.length === 0 && !loading ? <div className="panel empty-state">Aucune trace ne correspond aux filtres. Les clients peuvent désactiver la conservation dans leurs consentements IA.</div> : <div className="ai-trace-list">
       {traces.map((trace) => {
         const evaluation = evaluations[trace.id] || {}
@@ -938,7 +1240,7 @@ function AICostPage({ token }) {
       <div className="panel-head"><div><h2>Détail des appels</h2><p>Les tarifs sont appliqués au nombre de tokens entrant et sortant.</p></div><DollarSign size={19} className="muted-icon" /></div>
       <div className="ai-cost-table-wrap"><table className="ai-cost-table"><thead><tr><th>Date</th><th>Ticket</th><th>Client</th><th>Utilisateur</th><th>Modèle</th><th>Tokens entrée/sortie</th><th>Coût estimé</th></tr></thead><tbody>
         {costs.items.map((item) => <tr key={item.id}><td>{date(item.created_at)}</td><td>{item.ticket_reference}</td><td>{item.customer_name}</td><td>{item.actor_name || 'Automatique'}</td><td>{item.provider}/{item.model}</td><td>{item.input_tokens} / {item.output_tokens}</td><td>{item.cost_usd === null ? 'Tarif manquant' : `$${Number(item.cost_usd).toFixed(6)}`}</td></tr>)}
-        {!costs.items.length && <tr><td colSpan="7">{loading ? 'Chargement…' : 'Aucun appel pour ces filtres.'}</td></tr>}
+        {!costs.items.length && <tr><td colSpan="7">{loading ? <Loader inline label="Chargement des coûts…" /> : 'Aucun appel pour ces filtres.'}</td></tr>}
       </tbody></table></div>
       <Pagination page={Math.floor(offset / pageSize) + 1} pageSize={pageSize} total={costs.total_count || 0} sizes={[50, 100, 200, 500]} label="appels" disabled={loading} setPage={(value) => setOffset((value - 1) * pageSize)} setPageSize={(size) => { setPageSizeState(size); rememberPageSize('ai-costs', size); setOffset(0) }} />
     </section>
@@ -1070,7 +1372,7 @@ function App() {
       setPage('home')
     }
     if (user && user.role !== 'customer' && page === 'ai-consent') setPage('home')
-    if (user && user.role !== 'admin' && page === 'ai-diagnostics') setPage('home')
+    if (user && user.role !== 'admin' && (page === 'ai-diagnostics' || page === 'ai-ticket')) setPage('home')
   }, [page, user?.role])
 
   useEffect(() => {
@@ -1166,6 +1468,7 @@ function App() {
       isAdmin && { page: 'ai-traces', label: 'Évaluation LLM', icon: ClipboardList },
       isAdmin && { page: 'ai-costs', label: 'Coûts IA', icon: DollarSign },
       isAdmin && { page: 'ai-diagnostics', label: 'Diagnostic IA', icon: Activity },
+      isAdmin && { page: 'ai-ticket', label: 'Diagnostic ticket', icon: ListFilter },
     ] },
     { label: 'Système', items: [
       isAdmin && { page: 'supervision', label: 'Supervision', icon: ShieldCheck },
@@ -1200,7 +1503,7 @@ function App() {
       </aside>
       <main className="main-area">
         <header className="topbar">
-          <div className="breadcrumbs"><span>Support</span><span className="crumb-slash">/</span><b>{page === 'profile' ? 'Mon profil' : page === 'ticket' ? selected?.reference : page === 'new' ? 'Nouveau ticket' : page === 'team' ? 'Utilisateurs' : page === 'supervision' ? 'Supervision' : page === 'ai-routing' ? 'Configuration IA' : page === 'ai-traces' ? 'Évaluation LLM' : page === 'ai-costs' ? 'Coûts IA' : page === 'ai-diagnostics' ? 'Diagnostic IA' : page === 'ai-consent' ? 'Confidentialité IA' : page === 'rag' ? 'Corpus RAG' : page === 'kb' ? 'KB constructeur' : page === 'company-docs' ? 'Documents entreprise' : page === 'help' ? 'Console d’aide' : page === 'companies' ? 'Entreprises' : page === 'access-requests' ? 'Demandes d’accès' : page === 'service' ? 'SLA, rapports & factures' : page === 'billing' ? 'Facturation' : isStaff ? 'File de support' : 'Mes demandes'}</b></div>
+          <div className="breadcrumbs"><span>Support</span><span className="crumb-slash">/</span><b>{page === 'profile' ? 'Mon profil' : page === 'ticket' ? selected?.reference : page === 'new' ? 'Nouveau ticket' : page === 'team' ? 'Utilisateurs' : page === 'supervision' ? 'Supervision' : page === 'ai-routing' ? 'Configuration IA' : page === 'ai-traces' ? 'Évaluation LLM' : page === 'ai-costs' ? 'Coûts IA' : page === 'ai-diagnostics' ? 'Diagnostic IA' : page === 'ai-ticket' ? 'Diagnostic ticket' : page === 'ai-consent' ? 'Confidentialité IA' : page === 'rag' ? 'Corpus RAG' : page === 'kb' ? 'KB constructeur' : page === 'company-docs' ? 'Documents entreprise' : page === 'help' ? 'Console d’aide' : page === 'companies' ? 'Entreprises' : page === 'access-requests' ? 'Demandes d’accès' : page === 'service' ? 'SLA, rapports & factures' : page === 'billing' ? 'Facturation' : isStaff ? 'File de support' : 'Mes demandes'}</b></div>
           <div className="topbar-right"><span className="online-pill"><span className="live-dot" /> Support disponible</span><Avatar name={user.full_name} size="small" /></div>
         </header>
         <div className="content">
@@ -1216,12 +1519,13 @@ function App() {
             onBack={() => { setPage('home'); loadTickets() }}
             onChange={() => refreshTicket()}
           />}
-          {page === 'ticket' && !selected && <div className="empty-state">Chargement de la demande…</div>}
+          {page === 'ticket' && !selected && <Loader label="Chargement de la demande…" />}
           {page === 'supervision' && user.role === 'admin' && <SupervisionPage overview={overview} />}
           {page === 'ai-routing' && user.role === 'admin' && <AIRoutingPage token={token} />}
           {page === 'ai-traces' && user.role === 'admin' && <AITracePage token={token} />}
           {page === 'ai-costs' && user.role === 'admin' && <AICostPage token={token} />}
           {page === 'ai-diagnostics' && user.role === 'admin' && <AIDiagnosticsPage token={token} />}
+          {page === 'ai-ticket' && user.role === 'admin' && <TicketTimelinePage token={token} />}
           {page === 'service' && <ServicePortalPage token={token} user={user} companies={companies} />}
           {page === 'billing' && user.role === 'admin' && <BillingAdminPage token={token} />}
           {page === 'help' && (isStaff || user.is_individual) && <HelpConsolePage token={token} user={user} tickets={tickets} />}
@@ -1293,7 +1597,7 @@ function Dashboard({ user, tickets, loading, filter, setFilter, search, setSearc
           <div className="filter-box"><ListFilter size={15} /><select value={filter} onChange={(e) => setFilter(e.target.value)}><option value="all">Tous les statuts</option>{Object.entries(statuses).map(([key, [label]]) => <option key={key} value={key}>{label}</option>)}</select><ChevronDown size={14} /></div>
         </div>
         <div className="ticket-list">
-          {loading ? <div className="empty-state">Chargement des incidents…</div> : tickets.length === 0 ? <div className="empty-state"><span className="empty-icon"><MessageCircle size={22} /></span><strong>Aucun incident pour le moment</strong><span>{isStaff ? 'Les nouvelles demandes apparaîtront ici.' : 'Créez une demande pour être accompagné par notre équipe.'}</span>{!isStaff && <button className="button secondary" onClick={onNew}><Plus size={16} />Créer une demande</button>}</div> : pager.items.map((ticket) => (
+          {loading ? <Loader label="Chargement des incidents…" /> : tickets.length === 0 ? <div className="empty-state"><span className="empty-icon"><MessageCircle size={22} /></span><strong>Aucun incident pour le moment</strong><span>{isStaff ? 'Les nouvelles demandes apparaîtront ici.' : 'Créez une demande pour être accompagné par notre équipe.'}</span>{!isStaff && <button className="button secondary" onClick={onNew}><Plus size={16} />Créer une demande</button>}</div> : pager.items.map((ticket) => (
             <button className="ticket-row" key={ticket.id} onClick={() => onOpen(ticket.id)}>
               <span className="ticket-type-icon"><Headset size={17} /></span>
               <span className="ticket-main"><strong>{ticket.title}</strong><span>{ticket.reference} <i>·</i> {ticket.product}{ticket.version ? ` ${ticket.version}` : ''} <i>·</i> {date(ticket.updated_at)}</span></span>
@@ -2106,7 +2410,7 @@ function AIRoutingPage({ token }) {
     }
   }
 
-  if (loading && !config) return <div className="empty-state">Chargement de la configuration IA…</div>
+  if (loading && !config) return <PageLoader eyebrow="ADMINISTRATION IA" title="Configuration des modèles IA" label="Chargement du routage, des modèles disponibles et des tarifs…" />
 
   return <div className="ai-routing-page">
     <div className="welcome-row"><div><span className="eyebrow">ADMINISTRATION IA</span><h1>Configuration des modèles IA</h1><p>Affectez des LLM par tâche et par public, définissez un ordre de priorité et basculez l’assistance générale sans perdre vos règles.</p></div><button className="button secondary" disabled={loading} onClick={loadConfig}><RefreshCw size={16} />Actualiser</button></div>
@@ -2220,6 +2524,7 @@ function HelpSources({ sources }) {
 
 function HelpConsolePage({ token, user, tickets }) {
   const [options, setOptions] = useState(null)
+  const [listLoaded, setListLoaded] = useState(false)
   const [list, setList] = useState({ items: [], total_count: 0 })
   const [search, setSearch] = useState('')
   const [listPage, setListPage] = useState(1)
@@ -2261,6 +2566,8 @@ function HelpConsolePage({ token, user, tickets }) {
       setList(await request(`/help/conversations?${params}`, { token }))
     } catch (err) {
       setError(err.message)
+    } finally {
+      setListLoaded(true)
     }
   }, [token, listPage, listSize, search])
 
@@ -2358,13 +2665,15 @@ function HelpConsolePage({ token, user, tickets }) {
             </button>
             <button type="button" className="icon-button" aria-label={`Supprimer ${item.title}`} title="Supprimer" onClick={() => remove(item)}><Trash2 size={14} /></button>
           </div>)}
-          {list.items.length === 0 && <div className="empty-state compact">Aucune conversation.</div>}
+          {!listLoaded && <Loader inline label="Chargement des conversations…" />}
+          {listLoaded && list.items.length === 0 && <div className="empty-state compact">Aucune conversation.</div>}
         </div>
         <Pagination page={listPage} pageSize={listSize} total={list.total_count} setPage={setListPage} setPageSize={(size) => { setListSize(size); rememberPageSize('help-conversations', size) }} sizes={[10, 25, 50]} label="conversations" compact />
       </aside>
 
       <section className="panel help-main">
-        {setup && !active && <form className="help-setup" onSubmit={start}>
+        {!restored && !active && <Loader label="Reprise de la conversation…" />}
+        {restored && setup && !active && <form className="help-setup" onSubmit={start}>
           <div className="panel-head"><div><h2>Nouvelle conversation</h2><p>Choisissez le périmètre de cette conversation. Il ne pourra plus être mélangé avec une autre entreprise.</p></div><Sparkles size={19} className="muted-icon" /></div>
           <label>Travailler sur un ticket <span className="optional">— facultatif</span>
             <select value={form.ticket_id} onChange={(event) => setForm({ ...form, ticket_id: event.target.value })}>
@@ -2543,7 +2852,7 @@ function CompanyDocsPage({ token, user, companies }) {
             {data.can_edit && <button type="button" className="icon-button rag-delete-document" title="Supprimer" aria-label={`Supprimer ${doc.filename}`} disabled={busy} onClick={() => remove(doc)}><Trash2 size={15} /></button>}
           </div>
         </div>)}
-      </div> : <div className="empty-state compact">{data ? 'Aucun document pour le moment.' : 'Chargement…'}</div>}
+      </div> : (data ? <div className="empty-state compact">Aucun document pour le moment.</div> : <Loader label="Chargement des documents…" />)}
       <Pagination {...pager} sizes={[10, 25, 50]} label="documents" />
     </section>
   </div>
@@ -2687,8 +2996,11 @@ function RagAdminPage({ token }) {
     indexed: 'Indexé',
     pending: 'À indexer',
     modified: 'Modifié',
+    partial: 'Indexation partielle',
     empty: 'Sans texte',
   }
+
+  if (!overview) return <PageLoader eyebrow="CORPUS RAG" title="Corpus documentaire" label="Chargement du corpus, des modèles d’embedding et de l’état des services…" error={error} onRetry={loadOverview} />
 
   return <div className="rag-admin-page">
     <div className="welcome-row">
@@ -2775,6 +3087,7 @@ function RagAdminPage({ token }) {
             [statusLabels.indexed]: ['Indexé', 'green'],
             [statusLabels.pending]: ['À indexer', 'amber'],
             [statusLabels.modified]: ['Modifié', 'blue'],
+            [statusLabels.partial]: ['Indexation partielle', 'amber'],
             [statusLabels.empty]: ['Sans texte', 'red'],
           }} />
           <button className="icon-button rag-delete-document" title="Supprimer ce document" aria-label={`Supprimer ${document.source}`} disabled={busy || ['pending', 'running'].includes(indexingStatus)} onClick={() => deleteDocuments([document.source])}><Trash2 size={15} /></button>
@@ -2980,6 +3293,8 @@ function KBAdminPage({ token, onOpenTicket }) {
       .sort((a, b) => new Date(a.ts) - new Date(b.ts))
   })()
 
+  if (!status) return <PageLoader eyebrow="KB CONSTRUCTEUR" title="Base de connaissances constructeur" label="Chargement de l’état du navigateur KB, des recherches et de l’archive…" error={error} onRetry={load} />
+
   return <div className="kb-admin-page">
     <div className="welcome-row">
       <div><span className="eyebrow">ADMINISTRATION IA</span><h1>Base de connaissances constructeur</h1><p>Enrichit le RAG avec les articles du Technical Knowledge Center et les documents (guides, présentations, packs) de la KB Alcatel via un navigateur conteneurisé. Si le module est coupé ou en panne, l’assistance IA fonctionne exactement comme avant.</p></div>
@@ -3103,7 +3418,7 @@ function KBAdminPage({ token, onOpenTicket }) {
             : <p className="field-hint">Aucune entrée (navigateur hors ligne ou module désactivé).</p>)}
           {debugTab === 'browser' && <Pagination {...logPager} sizes={[25, 50, 100, 200]} label="évènements" />}
         </div>
-      </div> : <div className="empty-state compact">Chargement du journal…</div>)}
+      </div> : <Loader inline label="Chargement du journal…" />)}
     </section>
   </div>
 }
@@ -3124,6 +3439,8 @@ function SupervisionPage({ overview }) {
     if (status === 'disabled') return 'Désactivé'
     return 'Erreur'
   }
+
+  if (!overview) return <PageLoader eyebrow="SUPERVISION" title="Console d’administration" label="Chargement de l’état des services…" />
 
   return <div className="supervision-page">
     <div className="welcome-row"><div><span className="eyebrow">SUPERVISION</span><h1>Console d’administration</h1><p>Suivez l’état des services et les indicateurs de support en temps réel.</p></div></div>

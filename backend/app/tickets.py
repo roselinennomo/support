@@ -11,6 +11,9 @@ from fastapi.responses import FileResponse
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+import time
+
+from app.ai_steps import record_step, step, traced_run
 from app.ai import AIRoutingDisabledError, AIAnalysisError, assist_agent, respond_to_customer
 from app.ai_routing import ModelSelection, resolve_selection, routing_role
 from app.auth import get_current_user, require_roles
@@ -152,6 +155,11 @@ def _assistant_user(db: Session) -> User:
 
 
 def _conversation_context(ticket_id: str, include_internal: bool) -> tuple[SimpleNamespace, list[dict[str, str]], list[str]]:
+    with step("db", "ctx.load", include_internal=include_internal):
+        return _load_conversation_context(ticket_id, include_internal)
+
+
+def _load_conversation_context(ticket_id: str, include_internal: bool) -> tuple[SimpleNamespace, list[dict[str, str]], list[str]]:
     with SessionLocal() as db:
         ticket = db.get(Ticket, ticket_id)
         if not ticket:
@@ -182,6 +190,7 @@ def _conversation_context(ticket_id: str, include_internal: bool) -> tuple[Simpl
     return ticket_snapshot, conversation, attachment_names
 
 
+@traced_run("Diagnostic client (IA)")
 def _run_customer_ai(ticket_id: str) -> None:
     try:
         ticket_snapshot, conversation, attachment_names = _conversation_context(ticket_id, include_internal=False)
@@ -202,6 +211,7 @@ def _run_customer_ai(ticket_id: str) -> None:
                     db.commit()
             return
         result = respond_to_customer(ticket_snapshot, conversation, attachment_names)
+        save_started, save_clock = datetime.now(timezone.utc), time.perf_counter()
         with SessionLocal() as db:
             ticket = db.get(Ticket, ticket_id)
             if not ticket or ticket.status != "ai_triage":
@@ -234,6 +244,7 @@ def _run_customer_ai(ticket_id: str) -> None:
             })
             ticket.updated_at = datetime.now(timezone.utc)
             db.commit()
+            record_step("db", "db.save_reply", "ok", save_started, round((time.perf_counter() - save_clock) * 1000))
     except Exception as exc:
         if isinstance(exc, AIAnalysisError):
             logger.warning("Customer AI triage failed for ticket %s: %s", ticket_id, exc)
@@ -304,6 +315,7 @@ def recover_stuck_ai_tickets(session_factory=None, background: bool = True) -> i
     return len(ticket_ids)
 
 
+@traced_run("Aide IA agent")
 def _run_agent_ai(
     ticket_id: str,
     question: str,
@@ -355,6 +367,7 @@ def _run_agent_ai(
             db.commit()
 
 
+@traced_run("Résumé de passation (IA)")
 def _run_handoff_summary(ticket_id: str) -> None:
     try:
         with SessionLocal() as db:

@@ -2,6 +2,7 @@ import json
 import logging
 import time
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from collections.abc import Callable
 from typing import TypedDict
 
@@ -9,6 +10,7 @@ import httpx
 from langgraph.graph import END, START, StateGraph
 
 from app.ai_routing import DEFAULT_TIMEOUT_SECONDS, ROLE_DEFAULT_TASK, allowed_choices, apply_preference, routing_for
+from app.ai_steps import record_step
 from app.config import settings
 from app.models import Ticket, TicketEvent
 from app.rag import reset_company_scope, retrieve_context, set_company_scope
@@ -157,6 +159,7 @@ def _call_provider(
         timeout = choice.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS
         usage_token = _provider_usage.set((0, 0))
         started_at = time.perf_counter()
+        started_dt = datetime.now(timezone.utc)
         try:
             if provider == "ollama":
                 response = _call_ollama(prompt, model, think=bool(choice.get("think", False)), timeout=timeout)
@@ -167,6 +170,10 @@ def _call_provider(
             if validate is not None:
                 validate(response)
             input_tokens, output_tokens = _provider_usage.get()
+            record_step("provider", f"{provider}/{model}", "ok", started_dt, round((time.perf_counter() - started_at) * 1000), {
+                "task": task, "role": role, "timeout_s": timeout, "think": bool(choice.get("think", False)),
+                "input_tokens": input_tokens, "output_tokens": output_tokens, "response_chars": len(response),
+            })
             trace_context = _trace_context.get()
             if trace_context:
                 try:
@@ -188,8 +195,25 @@ def _call_provider(
             return response, provider, model
         except (httpx.HTTPError, RuntimeError, ValueError, KeyError, TypeError) as exc:
             failures.append(f"{provider}/{model}: {exc}")
+            record_step("provider", f"{provider}/{model}", "failed", started_dt, round((time.perf_counter() - started_at) * 1000), {
+                "task": task, "role": role, "timeout_s": timeout, "think": bool(choice.get("think", False)),
+                "error": str(exc)[:500],
+            })
             trace_context = _trace_context.get()
-            if trace_context and trace_context.get("ticket_id"):  # pas d'événement de ticket pour la console d'aide
+            if trace_context and not trace_context.get("ticket_id"):  # console d'aide : pas de ticket où consigner
+                try:
+                    from app.database import SessionLocal
+                    from app.models import AIFailure
+
+                    with SessionLocal() as db:
+                        db.add(AIFailure(
+                            user_id=trace_context.get("customer_id"), task=task, provider=provider, model=model,
+                            error=str(exc)[:1000], duration_ms=round((time.perf_counter() - started_at) * 1000),
+                        ))
+                        db.commit()
+                except Exception:
+                    logger.exception("Could not persist AI failure for the help console")
+            if trace_context and trace_context.get("ticket_id"):
                 try:
                     from app.database import SessionLocal
 
@@ -279,7 +303,7 @@ def _call_anthropic(prompt: str, model: str | None = None, timeout: float = DEFA
         },
         json={
             "model": model or settings.anthropic_model,
-            "max_tokens": 900,
+            "max_tokens": settings.anthropic_max_tokens,
             "output_config": {"effort": "medium"},
             "messages": [{"role": "user", "content": prompt}],
         },
@@ -304,7 +328,12 @@ def _call_anthropic(prompt: str, model: str | None = None, timeout: float = DEFA
         int(usage.get("input_tokens") or 0),
         int(usage.get("output_tokens") or 0),
     ))
-    return payload["content"][0]["text"]
+    text = payload["content"][0]["text"]
+    if payload.get("stop_reason") == "max_tokens":
+        logger.warning("Anthropic response truncated at %s tokens", settings.anthropic_max_tokens)
+        if not _json_format.get():  # texte libre : on le signale plutôt que de couper silencieusement
+            text += "\n\n> ⚠️ Réponse tronquée : limite de longueur atteinte. Demandez-moi de continuer."
+    return text
 
 
 def _company_id_of(ticket) -> str | None:
@@ -346,9 +375,32 @@ def _reset_trace_context(token) -> None:
         _trace_context.reset(token)
 
 
+def _load_json_object(raw: str):
+    """Décode la réponse JSON d'un modèle, en tolérant le texte autour (bloc ```json, phrase d'introduction).
+
+    Lève ValueError avec le début de la réponse quand aucun objet JSON n'est exploitable, pour que le
+    diagnostic montre ce que le modèle a réellement renvoyé.
+    """
+    text = (raw or "").strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    for start in (index for index, char in enumerate(text) if char == "{"):
+        try:
+            value, _end = decoder.raw_decode(text[start:])
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    snippet = " ".join(text.split())[:120] or "réponse vide"
+    raise ValueError(f"La réponse IA n'est pas un JSON exploitable (début : « {snippet} »).")
+
+
 def _parse_analysis(raw: str) -> dict:
     # The model is asked for JSON; reject malformed output rather than inventing an answer.
-    result = json.loads(raw)
+    result = _load_json_object(raw)
     if not isinstance(result, dict):
         raise ValueError("La réponse IA n'est pas un objet JSON.")
     result["priority"] = _normalize_priority(result.get("priority"))
@@ -402,7 +454,7 @@ Conversation:
 
 
 def _parse_customer_result(raw: str) -> dict:
-    result = json.loads(raw)
+    result = _load_json_object(raw)
     if not isinstance(result, dict):
         raise ValueError("La réponse IA n'est pas un objet JSON.")
     if not isinstance(result.get("reply"), str) or not result["reply"].strip():

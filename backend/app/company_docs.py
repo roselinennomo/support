@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app import rag
 from app.auth import get_current_user
+from app.ai_steps import step
 from app.config import settings
 from app.database import get_db
 from app.doc_text import SUPPORTED_SUFFIXES, extract_text, is_supported
@@ -75,7 +76,7 @@ class CompanyIndex:
         points = []
         for start in range(0, len(chunks), _BATCH):
             batch = chunks[start:start + _BATCH]
-            for offset, (chunk, vector) in enumerate(zip(batch, rag._embed(batch), strict=True)):
+            for offset, (chunk, vector) in enumerate(zip(batch, rag._embed_for_index(batch), strict=True)):
                 points.append({
                     "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{self.company_id}:{doc_id}:{start + offset}")),
                     "vector": vector,
@@ -102,13 +103,16 @@ class CompanyIndex:
     def search(self, query: str, limit: int) -> list[dict]:
         if not self._exists():
             return []
-        matches = rag._qdrant_request(
-            "POST", f"/collections/{self.collection}/points/search",
-            json={
-                "vector": rag._embed([query])[0], "limit": limit, "with_payload": True,
-                "score_threshold": settings.rag_score_threshold,
-            },
-        ).json()["result"]
+        vector = rag._embed_query(query)
+        with step("rag", "rag.qdrant.company", collection=self.collection) as detail:
+            matches = rag._qdrant_request(
+                "POST", f"/collections/{self.collection}/points/search",
+                json={
+                    "vector": vector, "limit": limit, "with_payload": True,
+                    "score_threshold": settings.rag_score_threshold,
+                },
+            ).json()["result"]
+            detail["matches"] = len(matches)
         results = []
         for match in matches:
             payload = match.get("payload") or {}

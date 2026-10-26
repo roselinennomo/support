@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     ollama_num_ctx: int = 8192
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-5-5"
+    # Plafond de longueur d'une réponse (le coût ne dépend que des jetons réellement produits).
+    anthropic_max_tokens: int = 4096
     rag_documents_dir: str = "../support_docs"
     rag_qdrant_url: str = "http://localhost:6333"
     rag_collection: str = "support_documents"

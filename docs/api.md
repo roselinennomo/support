@@ -220,6 +220,12 @@ La réponse donne les extraits, leur source/page et leur score de similarité. C
 
 L'inscription publique ne peut pas définir un rôle interne ou créer directement un compte approuvé.
 
+`GET /api/admin/ai/diagnostics` accepte `source` (`all`, `ticket`, `console`) et `user_id` (utilisateur de la console) et renvoie un bloc `console` (activité hors ticket); les échecs de la console ont `source: "console"`.
+
+Les réponses JSON des modèles (diagnostic client, analyse) sont extraites même entourées d'un bloc ```json ou de texte; sinon l'erreur enregistrée cite le début de la réponse reçue.
+
+`GET /api/admin/ai/ticket-timeline?reference=` (administrateur) renvoie le parcours d'un ticket : `participants`, `entries` (horodatées, avec `from`/`to`, durée, état, détails sans contenu), `runs`, `latencies` (temps perçu, appels réussis, échecs, recherche documentaire, part non tracée) et `tracing_complete`. Voir `ticket-diagnostic.md`.
+
 ## Clients indépendants
 
 `POST /api/auth/register` accepte `account_type` : `company` (défaut, `company_code` obligatoire) ou `independent` (entreprise individuelle créée, compte en attente). `UserOut.is_individual` et `CompanyOut.is_individual` l'indiquent; `POST /api/companies/{id}/invitation-code` répond 409 pour une entreprise individuelle. Voir `independent-clients.md`.

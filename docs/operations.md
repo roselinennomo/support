@@ -39,6 +39,7 @@ Arrêt sans effacer les données : `docker compose down`. Effacement des tickets
 | `RAG_SCORE_THRESHOLD` | `0.35` | Score minimal de similarité Qdrant; les résultats plus faibles ne sont pas fournis au modèle. |
 | `ANTHROPIC_API_KEY` | vide | Clé API si `AI_PROVIDER=anthropic`. À ne jamais publier dans le dépôt ou dans l'interface. |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Identifiant de modèle Anthropic autorisé par le compte. |
+| `ANTHROPIC_MAX_TOKENS` | `4096` | Longueur maximale d'une réponse Anthropic, en jetons (avant 4096 elle était fixée à 900 et coupait les réponses longues). Une réponse coupée est signalée par un avertissement à la fin du message. Le coût ne dépend que des jetons réellement produits. |
 | `CORS_ORIGINS` | ports locaux 8080 et 5173 | Origines autorisées, séparées par des virgules. |
 | `UPLOAD_DIR` | `./uploads` | Répertoire des pièces jointes; Compose le monte sur le volume `support-uploads`. |
 | `MAX_ATTACHMENT_SIZE` | `10485760` | Taille maximale en octets par fichier (10 Mio par défaut). |

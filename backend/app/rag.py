@@ -2,6 +2,7 @@ import hashlib
 import logging
 import re
 import threading
+import time
 import uuid
 from contextvars import ContextVar
 from io import BytesIO
@@ -12,6 +13,7 @@ import httpx
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
+from app.ai_steps import step
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -22,8 +24,17 @@ _CHUNK_OVERLAP = 200
 _EMBED_BATCH_SIZE = 8  # petits lots : une requête de recherche n'attend pas derrière un gros lot d'indexation
 # Au-delà, la mise à jour de l'index n'est plus faite pendant la réponse IA mais en arrière-plan.
 _INLINE_SYNC_MAX_SOURCES = 2
+# ... ou dès que les fichiers à (ré)indexer dépassent cette taille : le travail se compte en minutes sur un CPU.
+_INLINE_SYNC_MAX_BYTES = 1_000_000
 _background_sync_guard = threading.Lock()
 _background_sync_active = False
+# Un seul lot d'indexation à la fois, toutes sources confondues (corpus, KB, documents d'entreprise) :
+# l'instance d'embeddings traite 2 requêtes en parallèle, un emplacement reste donc libre pour les questions.
+_index_gate = threading.Semaphore(1)
+_QUERY_CACHE_SECONDS = 60
+_QUERY_CACHE_MAX = 32
+_query_cache: dict[tuple, tuple[float, list[float]]] = {}
+_query_cache_lock = threading.Lock()
 
 
 # Modèles d'embedding proposés à l'administrateur (dimension de sortie fixe par modèle).
@@ -171,7 +182,39 @@ def _chunks(text: str) -> list[str]:
     return chunks
 
 
+def _embed_for_index(texts: list[str]) -> list[list[float]]:
+    """Embeddings d'un lot d'indexation : un seul à la fois, pour qu'une question ne passe jamais derrière plusieurs lots."""
+    with _index_gate:
+        return _embed(texts)
+
+
+def _embed_query(text: str) -> list[float]:
+    """Embedding d'une question, mis en cache quelques secondes : corpus, documents d'entreprise et KB la partagent."""
+    key = (embedding_model(), embedding_base_url(), text, id(_embed))
+    now = time.monotonic()
+    with _query_cache_lock:
+        cached = _query_cache.get(key)
+    if cached and now - cached[0] < _QUERY_CACHE_SECONDS:
+        with step("rag", "rag.embedding.cache", chars=len(text)):
+            return list(cached[1])
+    vector = _embed([text])[0]
+    with _query_cache_lock:
+        for stale in [item for item, (stored, _vector) in _query_cache.items() if now - stored >= _QUERY_CACHE_SECONDS]:
+            _query_cache.pop(stale, None)
+        while len(_query_cache) >= _QUERY_CACHE_MAX:
+            _query_cache.pop(next(iter(_query_cache)))
+        _query_cache[key] = (now, vector)
+    return list(vector)
+
+
 def _embed(texts: list[str]) -> list[list[float]]:
+    """Calcule les embeddings (étape tracée : durée, nombre de textes, modèle et instance Ollama)."""
+    with step("rag", "rag.embedding", texts=len(texts), chars=sum(len(text) for text in texts),
+              model=embedding_model(), instance=embedding_base_url()):
+        return _embed_request(texts)
+
+
+def _embed_request(texts: list[str]) -> list[list[float]]:
     response = httpx.post(
         f"{embedding_base_url()}/api/embed",
         json={"model": embedding_model(), "input": texts},
@@ -202,7 +245,7 @@ def _all_points() -> list[dict]:
             json={
                 "limit": 256,
                 "offset": offset,
-                "with_payload": ["source", "content_hash", "indexed_empty"],
+                "with_payload": ["source", "content_hash", "indexed_empty", "chunk_total"],
                 "with_vector": False,
             },
         ).json()["result"]
@@ -210,6 +253,72 @@ def _all_points() -> list[dict]:
         offset = response.get("next_page_offset")
         if offset is None:
             return points
+
+
+def _source_states(points: list[dict]) -> dict[str, dict[str, dict]]:
+    """Versions indexées de chaque source : {source: {hash: {chunks, total, empty}}}."""
+    versions: dict[str, dict[str, dict]] = {}
+    for point in points:
+        payload = point.get("payload") or {}
+        source = payload.get("source")
+        if not source:
+            continue
+        version = versions.setdefault(source, {}).setdefault(
+            payload.get("content_hash", ""), {"chunks": 0, "total": None, "empty": False},
+        )
+        if payload.get("indexed_empty"):
+            version["empty"] = True
+        else:
+            version["chunks"] += 1
+        if payload.get("chunk_total"):
+            version["total"] = payload["chunk_total"]
+    return versions
+
+
+def _is_complete(version: dict) -> bool:
+    """Une version est complète si tous ses extraits sont présents (les anciens index sans total le sont par définition)."""
+    return version["empty"] or version["total"] is None or version["chunks"] >= version["total"]
+
+
+def _point_id(source: str, digest: str, index: int) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{digest}:{index}"))
+
+
+def _existing_point_ids(source: str, digest: str) -> set[str]:
+    """Extraits de cette version du document déjà écrits (reprise d'une indexation interrompue)."""
+    found: set[str] = set()
+    offset = None
+    while True:
+        result = _qdrant_request(
+            "POST",
+            f"/collections/{collection_name()}/points/scroll",
+            json={
+                "limit": 1024,
+                "offset": offset,
+                "with_payload": False,
+                "with_vector": False,
+                "filter": {"must": [
+                    {"key": "source", "match": {"value": source}},
+                    {"key": "content_hash", "match": {"value": digest}},
+                ]},
+            },
+        ).json()["result"]
+        found.update(str(point["id"]) for point in result["points"])
+        offset = result.get("next_page_offset")
+        if offset is None:
+            return found
+
+
+def _delete_other_versions(source: str, digest: str) -> None:
+    _qdrant_request(
+        "POST",
+        f"/collections/{collection_name()}/points/delete",
+        params={"wait": "true"},
+        json={"filter": {
+            "must": [{"key": "source", "match": {"value": source}}],
+            "must_not": [{"key": "content_hash", "match": {"value": digest}}],
+        }},
+    )
 
 
 def _index_source(source: str, digest: str, pages: list[tuple[int | None, str]]) -> None:
@@ -238,34 +347,37 @@ def _index_source(source: str, digest: str, pages: list[tuple[int | None, str]])
         )
         return
 
-    points = []
-    for batch_start in range(0, len(chunks), _EMBED_BATCH_SIZE):
+    # Chaque lot est écrit dès qu'il est calculé : une interruption (redémarrage, délai) ne perd que le lot en cours,
+    # et une nouvelle exécution reprend où la précédente s'est arrêtée (identifiants déterministes).
+    total = len(chunks)
+    done = _existing_point_ids(source, digest)
+    for batch_start in range(0, total, _EMBED_BATCH_SIZE):
         batch = chunks[batch_start:batch_start + _EMBED_BATCH_SIZE]
-        embeddings = _embed([chunk for _, chunk in batch])
-        points.extend(
-            {
-                "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{digest}:{index}")),
-                "vector": embedding,
-                "payload": {
-                    "source": source,
-                    "content_hash": digest,
-                    "page": page_number,
-                    "text": chunk,
-                },
-            }
-            for index, ((page_number, chunk), embedding) in enumerate(
-                zip(batch, embeddings, strict=True),
-                start=batch_start,
-            )
-        )
-    _delete_source(source)
-    for batch_start in range(0, len(points), _EMBED_BATCH_SIZE):
+        ids = [_point_id(source, digest, index) for index in range(batch_start, batch_start + len(batch))]
+        if all(point_id in done for point_id in ids):
+            continue
+        embeddings = _embed_for_index([chunk for _, chunk in batch])
         _qdrant_request(
             "PUT",
             f"/collections/{collection_name()}/points",
             params={"wait": "true"},
-            json={"points": points[batch_start:batch_start + _EMBED_BATCH_SIZE]},
+            json={"points": [
+                {
+                    "id": point_id,
+                    "vector": embedding,
+                    "payload": {
+                        "source": source,
+                        "content_hash": digest,
+                        "page": page_number,
+                        "text": chunk,
+                        "chunk_total": total,
+                    },
+                }
+                for point_id, ((page_number, chunk), embedding) in zip(ids, zip(batch, embeddings, strict=True), strict=True)
+            ]},
         )
+    # Les versions précédentes restent cherchables jusqu'à ce que la nouvelle soit complète.
+    _delete_other_versions(source, digest)
 
 
 def _delete_source(source: str) -> None:
@@ -294,6 +406,7 @@ def delete_sources(sources: list[str]) -> None:
 def _sync_documents(
     progress_callback: Callable[[dict[str, str | int]], None] | None = None,
     max_sources: int | None = None,
+    max_bytes: int | None = None,
 ) -> dict[str, int]:
     root = Path(settings.rag_documents_dir).resolve()
     if not root.is_dir():
@@ -317,21 +430,20 @@ def _sync_documents(
         content = path.read_bytes()
         current[source] = (hashlib.sha256(content).hexdigest(), path)
 
-    existing: dict[str, str] = {}
-    for point in _all_points():
-        payload = point.get("payload") or {}
-        source = payload.get("source")
-        if source:
-            existing[source] = payload.get("content_hash", "")
-
-    deleted_sources = sorted(existing.keys() - current.keys())
+    states = _source_states(_all_points())
+    complete = {
+        source: {digest for digest, version in versions.items() if _is_complete(version)}
+        for source, versions in states.items()
+    }
+    deleted_sources = sorted(states.keys() - current.keys())
     changed_sources = [
         (source, digest, path)
         for source, (digest, path) in current.items()
-        if existing.get(source) != digest
+        if digest not in complete.get(source, set())
     ]
     total = len(deleted_sources) + len(changed_sources)
-    if max_sources is not None and total > max_sources:
+    changed_bytes = sum(path.stat().st_size for _source, _digest, path in changed_sources)
+    if (max_sources is not None and total > max_sources) or (max_bytes is not None and changed_bytes > max_bytes):
         # Trop de travail pour une réponse en direct : l'appelant l'exécutera en arrière-plan.
         return {"source_count": len(current), "indexed_sources": 0, "deleted_sources": 0, "deferred_sources": total}
     processed = 0
@@ -493,43 +605,33 @@ def inspect_index() -> dict:
         points = []
         qdrant_error = str(exc)
 
-    indexed: dict[str, dict] = {}
-    for point in points:
-        payload = point.get("payload") or {}
-        source = payload.get("source")
-        if not source:
-            continue
-        source_data = indexed.setdefault(source, {
-            "content_hash": payload.get("content_hash", ""),
-            "chunks": 0,
-            "empty": False,
-        })
-        source_data["empty"] = source_data["empty"] or payload.get("indexed_empty", False)
-        if not payload.get("indexed_empty", False):
-            source_data["chunks"] += 1
+    indexed = _source_states(points)
 
     documents = []
     for source, digest in current.items():
-        indexed_source = indexed.get(source)
-        if not indexed_source:
-            status = "pending"
-        elif indexed_source["content_hash"] != digest:
-            status = "modified"
-        elif indexed_source["empty"]:
-            status = "empty"
+        versions = indexed.get(source)
+        current_version = versions.get(digest) if versions else None
+        if not versions:
+            status, chunks = "pending", 0
+        elif current_version is None:
+            status, chunks = "modified", max(version["chunks"] for version in versions.values())
+        elif current_version["empty"]:
+            status, chunks = "empty", current_version["chunks"]
+        elif not _is_complete(current_version):
+            status, chunks = "partial", current_version["chunks"]  # indexation interrompue : elle reprendra
         else:
-            status = "indexed"
+            status, chunks = "indexed", current_version["chunks"]
         documents.append({
             "source": source,
             "size_bytes": (root / source).stat().st_size,
             "status": status,
-            "chunks": indexed_source["chunks"] if indexed_source else 0,
+            "chunks": chunks,
         })
     deleted_sources = sorted(indexed.keys() - current.keys())
 
     embedding = embedding_status()
 
-    stale_count = sum(document["status"] in {"pending", "modified"} for document in documents)
+    stale_count = sum(document["status"] in {"pending", "modified", "partial"} for document in documents)
     return {
         "collection": collection_name(),
         "embedding_model": embedding_model(),
@@ -570,20 +672,22 @@ def evaluate_query(query: str) -> dict:
                 f"La collection Qdrant utilise {configured_size} dimensions, "
                 f"mais RAG_EMBEDDING_DIMENSION vaut {embedding_dimension()}."
             )
-        query_vector = _embed([query])[0]
-        matches = _qdrant_request(
-            "POST",
-            f"/collections/{collection_name()}/points/search",
-            json={
-                "vector": query_vector,
-                "limit": settings.rag_top_k,
-                "with_payload": True,
-                "score_threshold": settings.rag_score_threshold,
-                "filter": {
-                    "must_not": [{"key": "indexed_empty", "match": {"value": True}}]
+        query_vector = _embed_query(query)
+        with step("rag", "rag.qdrant", collection=collection_name()) as detail:
+            matches = _qdrant_request(
+                "POST",
+                f"/collections/{collection_name()}/points/search",
+                json={
+                    "vector": query_vector,
+                    "limit": settings.rag_top_k,
+                    "with_payload": True,
+                    "score_threshold": settings.rag_score_threshold,
+                    "filter": {
+                        "must_not": [{"key": "indexed_empty", "match": {"value": True}}]
+                    },
                 },
-            },
-        ).json()["result"]
+            ).json()["result"]
+            detail["matches"] = len(matches)
     except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError, RAGError) as exc:
         raise RAGError(f"Échec de l’évaluation de recherche RAG : {exc}") from exc
     return {
@@ -634,19 +738,38 @@ def _sync_before_search() -> None:
         return
     try:
         _ensure_collection()
-        result = _sync_documents(max_sources=_INLINE_SYNC_MAX_SOURCES)
+        result = _sync_documents(max_sources=_INLINE_SYNC_MAX_SOURCES, max_bytes=_INLINE_SYNC_MAX_BYTES)
     finally:
         _sync_lock.release()
     if result and result.get("deferred_sources"):
         _start_background_sync()
 
 
+def resume_pending_sync() -> None:
+    """Au démarrage : relance en arrière-plan l'indexation interrompue, sans attendre la prochaine question."""
+    try:
+        if not _sync_lock.acquire(blocking=False):
+            return
+        try:
+            _ensure_collection()
+            result = _sync_documents(max_bytes=0)  # rien n'est indexé ici : on ne fait que constater le travail restant
+        finally:
+            _sync_lock.release()
+        if result and result.get("deferred_sources"):
+            _start_background_sync()
+    except Exception as exc:  # Qdrant ou Ollama pas encore prêts : la prochaine question réessaiera
+        logger.warning("RAG: reprise de l'indexation impossible pour l'instant : %s", exc)
+
+
 def retrieve_context(query: str) -> str:
     try:
-        _sync_before_search()
+        with step("rag", "rag.sync"):
+            _sync_before_search()
         if not query.strip():
             return "Aucun extrait documentaire pertinent n'a été fourni."
-        evaluation = evaluate_query(query)
+        with step("rag", "rag.search", query_chars=len(query)) as detail:
+            evaluation = evaluate_query(query)
+            detail["results"] = len(evaluation["results"])
     except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError, RAGError) as exc:
         raise RAGError(f"Échec de la synchronisation ou de la recherche RAG : {exc}") from exc
 
@@ -657,8 +780,14 @@ def retrieve_context(query: str) -> str:
         reference = f"{source}, page {page}" if page else source
         excerpts.append(f"[Source : {reference}]\n{match['text']}")
     # Documents propres à l'entreprise en premier (les plus spécifiques), puis corpus commun et KB constructeur.
-    excerpts = _company_excerpts(query) + excerpts
-    excerpts.extend(_kb_excerpts(query))
+    with step("rag", "rag.company") as detail:
+        company = _company_excerpts(query)
+        detail["excerpts"] = len(company)
+    excerpts = company + excerpts
+    with step("rag", "rag.kb") as detail:
+        kb = _kb_excerpts(query)
+        detail["excerpts"] = len(kb)
+    excerpts.extend(kb)
     return "\n\n".join(excerpts) or "Aucun extrait documentaire pertinent n'a été trouvé."
 
 

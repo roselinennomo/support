@@ -32,6 +32,7 @@ Pour arrêter les services : `docker compose down`. Pour supprimer aussi les don
 - Notes internes, changements de statut, attribution à un agent et historique d'audit.
 - Rôles `customer`, `agent` et `admin`; les agents sont limités aux entreprises auxquelles ils sont affectés, et la création d'agents est réservée à l'administrateur.
 - Choix du fournisseur IA par configuration (`ollama` par défaut ou `anthropic`).
+- Diagnostic ticket (parcours de bout en bout, diagramme de séquence, temps perçu vs appels aux modèles) : voir [docs/ticket-diagnostic.md](docs/ticket-diagnostic.md).
 - Clients indépendants (entreprise individuelle, facturation propre, console d'aide) : voir [docs/independent-clients.md](docs/independent-clients.md).
 - Console d'aide (administrateurs, agents et clients indépendants) : conversations libres ou sur un ticket, connaissances communes + documents d'une entreprise, recherche live du portail constructeur et recherche web optionnelles : voir [docs/help-console.md](docs/help-console.md).
 - Documents propres à chaque entreprise (privés, index séparé, déposés par l'entreprise ou un administrateur) : voir [docs/company-docs.md](docs/company-docs.md).

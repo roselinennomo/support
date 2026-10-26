@@ -9,7 +9,7 @@ from app.auth import require_roles
 from app.ai_routing import AI_ROLES, AI_TASKS, get_routing_config, provider_catalog
 from app.rag import embedding_status, qdrant_status
 from app.database import get_db
-from app.models import AIExecution, AIModelPrice, AIRoutingConfig, Ticket, TicketEvent, User
+from app.models import AIExecution, AIFailure, AIModelPrice, AIRoutingConfig, Ticket, TicketEvent, User
 
 router = APIRouter(prefix="/api/admin/ai", tags=["ai"])
 TRACE_RETENTION_DAYS = 30
@@ -28,6 +28,9 @@ def purge_expired_trace_content() -> int:
             )
             .values(prompt=None, response=None)
         )
+        from app.models import AIStep
+
+        db.execute(AIStep.__table__.delete().where(AIStep.started_at < cutoff))
         db.commit()
         return result.rowcount or 0
 
@@ -226,6 +229,10 @@ def list_traces(
     }
 
 
+def _utc(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 @router.get("/catalog")
 def filter_catalog(
     db: Session = Depends(get_db),
@@ -259,6 +266,8 @@ def filter_catalog(
 @router.get("/diagnostics")
 def ai_diagnostics(
     reference: str | None = None,
+    source: str = Query(default="all", pattern="^(all|ticket|console)$"),
+    user_id: str | None = None,
     db: Session = Depends(get_db),
     _admin: User = Depends(require_roles("admin")),
 ):
@@ -277,7 +286,7 @@ def ai_diagnostics(
             })
 
     failure_event_types = ("ai_provider_failed", "ai_analysis_failed", "ai_handoff_summary_failed")
-    failure_rows = db.execute(
+    failure_rows = [] if source == "console" else db.execute(
         select(TicketEvent, Ticket.reference, Ticket.title, Ticket.status, Ticket.ai_status)
         .join(Ticket, TicketEvent.ticket_id == Ticket.id)
         .where(TicketEvent.event_type.in_(failure_event_types))
@@ -285,6 +294,7 @@ def ai_diagnostics(
         .limit(20)
     ).all()
     recent_failures = [{
+        "source": "ticket",
         "reference": ticket_reference,
         "title": title,
         "status": status,
@@ -296,6 +306,18 @@ def ai_diagnostics(
         "task": (event.details or {}).get("task", ""),
         "created_at": event.created_at,
     } for event, ticket_reference, title, status, ai_status in failure_rows]
+    if source != "ticket":
+        console_failures = select(AIFailure, User.full_name).outerjoin(User, AIFailure.user_id == User.id)
+        if user_id:
+            console_failures = console_failures.where(AIFailure.user_id == user_id)
+        for failure, person in db.execute(console_failures.order_by(AIFailure.created_at.desc()).limit(20)).all():
+            recent_failures.append({
+                "source": "console", "reference": "Console d’aide", "title": person or "Utilisateur supprimé",
+                "status": "", "ai_status": "", "event_type": "ai_provider_failed", "message": failure.error,
+                "provider": failure.provider, "model": failure.model, "task": failure.task, "created_at": failure.created_at,
+            })
+        recent_failures.sort(key=lambda item: _utc(item["created_at"]), reverse=True)
+        recent_failures = recent_failures[:20]
 
     providers = provider_catalog()
     for provider in providers:
@@ -315,6 +337,14 @@ def ai_diagnostics(
             .order_by(TicketEvent.created_at.desc())
             .limit(1)
         ).first()
+        console_failure = db.execute(
+            select(AIFailure.error, AIFailure.created_at)
+            .where(AIFailure.provider == provider_id)
+            .order_by(AIFailure.created_at.desc())
+            .limit(1)
+        ).first()
+        if console_failure and (not latest_failure or _utc(console_failure.created_at) > _utc(latest_failure.created_at)):
+            latest_failure = type("Failure", (), {"details": {"error": console_failure.error}, "created_at": console_failure.created_at})()
         provider["last_success_at"] = last_success.created_at if last_success else None
         provider["last_success_model"] = last_success.model if last_success else ""
         provider["last_failure_at"] = latest_failure.created_at if latest_failure else None
@@ -393,14 +423,58 @@ def ai_diagnostics(
             } for execution in executions],
         }
 
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    console_rows = db.execute(
+        select(AIExecution, User.full_name)
+        .join(User, AIExecution.customer_id == User.id)
+        .where(AIExecution.ticket_id.is_(None), *([AIExecution.customer_id == user_id] if user_id else []))
+        .order_by(AIExecution.created_at.desc())
+        .limit(20)
+    ).all()
+    console_users = db.execute(
+        select(User.id, User.full_name).where(User.id.in_(
+            select(AIExecution.customer_id).where(AIExecution.ticket_id.is_(None)).union(select(AIFailure.user_id))
+        )).order_by(User.full_name)
+    ).all()
+    console = {
+        "executions_24h": db.scalar(select(func.count()).select_from(AIExecution).where(
+            AIExecution.ticket_id.is_(None), AIExecution.created_at >= since)) or 0,
+        "failures_24h": db.scalar(select(func.count()).select_from(AIFailure).where(AIFailure.created_at >= since)) or 0,
+        "users": [{"id": uid, "name": name} for uid, name in console_users],
+        "recent_executions": [{
+            "user": person, "task": execution.task, "provider": execution.provider, "model": execution.model,
+            "input_tokens": execution.input_tokens, "output_tokens": execution.output_tokens,
+            "duration_ms": execution.duration_ms, "created_at": execution.created_at,
+        } for execution, person in console_rows],
+    }
+
     return {
         "routing_enabled": config["enabled"],
+        "console": console,
         "providers": providers,
         "routes": routes,
         "embedding": embedding_status(),
         "rag": qdrant_status(),
         "recent_failures": recent_failures,
         "ticket": ticket_diagnostic,
+    }
+
+
+@router.get("/ticket-timeline")
+def ticket_timeline(
+    reference: str,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
+):
+    """Parcours complet d'un ticket (messages, traitements IA, recherche documentaire, fournisseurs, KB)."""
+    from app.ticket_timeline import build_timeline
+
+    ticket = db.scalar(select(Ticket).where(Ticket.reference == reference.strip().upper()))
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket introuvable.")
+    return {
+        "reference": ticket.reference, "title": ticket.title, "status": ticket.status, "ai_status": ticket.ai_status,
+        "ai_error": ticket.ai_error, "created_at": ticket.created_at, **build_timeline(db, ticket),
     }
 
 
